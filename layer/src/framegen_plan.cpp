@@ -364,6 +364,9 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
     // With the previous frame's depth, content it did not see is told apart
     // from content that moved.
     const bool depth_previous = request.depth && request.depth_previous;
+    // The game's own motion vectors, where the backend has them: tried as
+    // hypotheses against the luma pair instead of measuring the motion.
+    const bool game_flow = request.game_motion.valid && !tuning.hardware_flow;
     FrameGenDispatch luma = Dispatch(FrameGenPass::kLuma, plan.levels[1], plan.levels[0], base);
     luma.inputs = {Texture(FrameGenTextureKind::kHistoryNewest), Texture(FrameGenTextureKind::kHistoryPrevious), depth,
                    depth_previous ? Texture(FrameGenTextureKind::kDepthPrevious) : FrameGenTexture{}, {}};
@@ -396,7 +399,29 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         plan.dispatches.push_back(unpack);
     }
 
-    for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels && !tuning.hardware_flow; ++level) {
+    if (game_flow) {
+        // One vector per cell of the final flow level, chosen among the
+        // game's vectors around the cell and no motion by the cost of
+        // matching the luma pair (see FG_PASS_FLOW_GAME). tuning.xy: a
+        // vector's unit in uv of the view; tuning.zw: the game's render
+        // region in texels, whose origin in the texture is options.x and
+        // options.z; options.w: texels of the luma a cell covers.
+        const FrameGenGameMotion& motion = request.game_motion;
+        const float render_width = static_cast<float>(motion.render_width ? motion.render_width : motion.width);
+        const float render_height = static_cast<float>(motion.render_height ? motion.render_height : motion.height);
+        FrameGenDispatch game = Dispatch(FrameGenPass::kFlowGame, plan.levels[plan.final_flow_level], plan.levels[1], base);
+        game.inputs = {Texture(FrameGenTextureKind::kGameMotion), Texture(FrameGenTextureKind::kLumaNewest, 1),
+                       Texture(FrameGenTextureKind::kLumaPrevious, 1), depth, {}, {}};
+        game.outputs = {Texture(FrameGenTextureKind::kFlow, plan.final_flow_level), {}};
+        game.constants.tuning = {motion.scale_x / std::max(render_width, 1.0f), motion.scale_y / std::max(render_height, 1.0f),
+                                 render_width, render_height};
+        game.constants.options[0] = motion.base_x;
+        game.constants.options[2] = motion.base_y;
+        game.constants.options[3] = 1u << (plan.final_flow_level - 1);
+        plan.dispatches.push_back(game);
+    }
+
+    for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels && !tuning.hardware_flow && !game_flow; ++level) {
         FrameGenDispatch down = Dispatch(FrameGenPass::kDownsample, plan.levels[level], plan.levels[level - 1], base);
         down.inputs = {Texture(FrameGenTextureKind::kLumaNewest, level - 1),
                        Texture(FrameGenTextureKind::kLumaPrevious, level - 1), {}, {}, {}};
@@ -407,7 +432,7 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
 
     // Flow passes match on luma at `match` and write one vector per cell of
     // the flow level; options.w carries the cell size in match texels.
-    if (!tuning.hardware_flow) {
+    if (!tuning.hardware_flow && !game_flow) {
         FrameGenDispatch search = Dispatch(FrameGenPass::kSearch, plan.levels[kFrameGenPyramidLevels],
                                            plan.levels[kFrameGenPyramidLevels], base);
         search.inputs = {Texture(FrameGenTextureKind::kLumaNewest, kFrameGenPyramidLevels),
@@ -417,8 +442,8 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         plan.dispatches.push_back(search);
     }
 
-    for (std::uint8_t level = kFrameGenPyramidLevels - 1; level >= plan.final_flow_level && !tuning.hardware_flow;
-         --level) {
+    for (std::uint8_t level = kFrameGenPyramidLevels - 1;
+         level >= plan.final_flow_level && !tuning.hardware_flow && !game_flow; --level) {
         const std::uint8_t match = FrameGenMatchLevel(level);
         FrameGenDispatch refine = Dispatch(FrameGenPass::kRefine, plan.levels[level], plan.levels[level + 1], base);
         refine.inputs = {Texture(FrameGenTextureKind::kLumaNewest, match), Texture(FrameGenTextureKind::kLumaPrevious, match),
@@ -854,6 +879,7 @@ FrameGenViewRequest FrameGenHistoryState::Effective(const FrameGenViewRequest& r
     effective.synthesize = request.synthesize && history_valid_[Previous()];
     effective.temporal = effective.synthesize && request.temporal && filtered_valid_[Previous()];
     effective.trust_history = effective.synthesize && trust_valid_[Previous()];
+    effective.game_motion.valid = effective.game_motion.valid && effective.synthesize;
     return effective;
 }
 

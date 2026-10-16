@@ -133,6 +133,9 @@ struct ViewResources {
     // newest and previous textures are in (-1: the history state's own).
     int bound_newest{-1};
     int bound_previous{-1};
+    // The game's motion vectors (FrameGenViewRequest::game_motion), copied
+    // from the capture DLL's shared texture for this frame.
+    Texture game_motion;
     Texture shift_keys;
     Texture shift_map; // rebuilt for each generated frame
     Texture depth_stale; // kDepthStale's, for a frame moved by the previous frame's motion
@@ -827,6 +830,7 @@ class D3D12FrameGen final : public FrameGenGpu {
     }
 
     bool SupportsDepth() const override { return true; }
+    bool SupportsGameMotion() const override { return true; }
     XrSwapchainUsageFlags RequiredDepthUsage() const override { return XR_SWAPCHAIN_USAGE_SAMPLED_BIT; }
 
     // The plane-0 view of a depth format, readable in a shader.
@@ -1729,7 +1733,14 @@ class D3D12FrameGen final : public FrameGenGpu {
         FrameGenTuning effective_tuning = tuning;
         effective_tuning.occlusion = tuning.occlusion && occlusion_;
         effective_tuning.cross_fade = tuning.cross_fade || cross_fade_;
-        effective_tuning.hardware_flow = tuning.hardware_flow && HardwareFlowReady();
+        // The game's own motion vectors replace the optical flow hardware
+        // when every view has them (a view without them would otherwise
+        // need the hardware's session as well).
+        bool game_all = !views.empty();
+        for (std::size_t i = 0; i < views.size() && game_all; ++i) {
+            game_all = views[i].request.game_motion.valid && OpenGameMotion(views[i].request.game_motion, nullptr, nullptr);
+        }
+        effective_tuning.hardware_flow = tuning.hardware_flow && !game_all && HardwareFlowReady();
         // Several views on Frame Generation's own queue match on one atlas;
         // otherwise (one view, matching at release on the game's queue, or
         // the atlas refused) a session per view, its hints following that
@@ -4104,6 +4115,118 @@ class D3D12FrameGen final : public FrameGenGpu {
         return Create(view.output, submission.request.extent, intermediate, intermediate, true, error);
     }
 
+    // --- The game's motion vectors (mvcapture, in this process) ---
+
+    static bool GameFormat(DXGI_FORMAT format, DXGI_FORMAT& view_format) {
+        switch (format) {
+        case DXGI_FORMAT_R16G16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R32G32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            view_format = format;
+            return true;
+        case DXGI_FORMAT_R16G16_TYPELESS: view_format = DXGI_FORMAT_R16G16_FLOAT; return true;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: view_format = DXGI_FORMAT_R16G16B16A16_FLOAT; return true;
+        case DXGI_FORMAT_R32G32_TYPELESS: view_format = DXGI_FORMAT_R32G32_FLOAT; return true;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: view_format = DXGI_FORMAT_R32G32B32A32_FLOAT; return true;
+        default: return false;
+        }
+    }
+
+    // Opens (and caches) the shared texture and fence the capture DLL
+    // published; the NT handles are valid here, the DLL being in the same
+    // process. Either output may be null to just check. False when they
+    // cannot be used, with a one-time log.
+    bool OpenGameMotion(const FrameGenGameMotion& motion, ID3D12Resource** resource, ID3D12Fence** fence) {
+        if (game_motion_failed_ || !motion.texture || !motion.fence) {
+            return false;
+        }
+        auto fail = [&](const char* what, HRESULT hr) {
+            game_motion_failed_ = true; // not retried every frame
+            char text[160];
+            std::snprintf(text, sizeof(text), "game motion vectors unusable (%s, 0x%08lx)", what, static_cast<unsigned long>(hr));
+            game_motion_status_ = text;
+            return false;
+        };
+        auto found = game_textures_.find(motion.texture);
+        if (found != game_textures_.end() && found->second.generation != motion.generation) {
+            if (!WaitIdle()) {
+                return fail("wait", E_FAIL);
+            }
+            game_textures_.erase(found);
+            found = game_textures_.end();
+        }
+        if (found == game_textures_.end()) {
+            if (game_textures_.size() >= 32) {
+                if (!WaitIdle()) {
+                    return fail("wait", E_FAIL);
+                }
+                game_textures_.clear();
+            }
+            GameTexture entry;
+            entry.generation = motion.generation;
+            const HRESULT hr = device_->OpenSharedHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(motion.texture)),
+                                                         IID_PPV_ARGS(&entry.resource));
+            if (FAILED(hr)) {
+                return fail("texture", hr);
+            }
+            const D3D12_RESOURCE_DESC desc = entry.resource->GetDesc();
+            DXGI_FORMAT view_format{};
+            if (desc.DepthOrArraySize != 1 || !GameFormat(desc.Format, view_format)) {
+                return fail("format", E_INVALIDARG);
+            }
+            found = game_textures_.emplace(motion.texture, std::move(entry)).first;
+        }
+        if (!game_fence_ || game_fence_handle_ != motion.fence) {
+            ComPtr<ID3D12Fence> opened;
+            const HRESULT hr = device_->OpenSharedHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(motion.fence)),
+                                                         IID_PPV_ARGS(&opened));
+            if (FAILED(hr)) {
+                return fail("fence", hr);
+            }
+            game_fence_ = opened;
+            game_fence_handle_ = motion.fence;
+        }
+        if (resource) *resource = found->second.resource.Get();
+        if (fence) *fence = game_fence_.Get();
+        return true;
+    }
+
+    // Copies the game's vectors into the view's own texture, on the work
+    // queue after the capture DLL's copy finished.
+    bool CopyGameMotion(ViewResources& view, const FrameGenGameMotion& motion,
+                        std::vector<D3D12_RESOURCE_BARRIER>& barriers, std::string& error) {
+        ID3D12Resource* shared = nullptr;
+        ID3D12Fence* fence = nullptr;
+        if (!OpenGameMotion(motion, &shared, &fence)) {
+            return false;
+        }
+        const D3D12_RESOURCE_DESC desc = shared->GetDesc();
+        DXGI_FORMAT view_format{};
+        if (!GameFormat(desc.Format, view_format)) {
+            return false;
+        }
+        if (!view.game_motion.resource || view.game_motion.resource->GetDesc().Width != desc.Width ||
+            view.game_motion.resource->GetDesc().Height != desc.Height ||
+            view.game_motion.view_format != view_format) {
+            if (view.game_motion.resource && !WaitIdle()) {
+                return false;
+            }
+            if (!Create(view.game_motion, {static_cast<std::uint32_t>(desc.Width), desc.Height}, view_format, view_format,
+                        false, error, true)) {
+                return false;
+            }
+        }
+        work_->Wait(fence, motion.fence_value);
+        Require(barriers, view.game_motion, D3D12_RESOURCE_STATE_COPY_DEST);
+        Transition(barriers, shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Flush(barriers);
+        commands_->CopyResource(view.game_motion.resource.Get(), shared);
+        Transition(barriers, shared, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Flush(barriers);
+        return true;
+    }
+
     Texture* Resolve(ViewResources& view, FrameGenTexture texture) {
         // Recording Synthesize: the analyzed frame's slots.
         const std::uint8_t newest =
@@ -4137,6 +4260,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         case FrameGenTextureKind::kDepthScales: return &view.depth_scales;
         case FrameGenTextureKind::kDepthScaleVotes: return &view.depth_scale_votes;
         case FrameGenTextureKind::kDepthScaleRaw: return &view.depth_scale_raw;
+        case FrameGenTextureKind::kGameMotion: return &view.game_motion;
         default: return nullptr;
         }
     }
@@ -4218,6 +4342,11 @@ class D3D12FrameGen final : public FrameGenGpu {
         view.depth_ready = false;
         effective.trust_stereo = view.trust_stereo;
         view.trust_stereo = false;
+        if (effective.game_motion.valid && !tuning.hardware_flow) {
+            effective.game_motion.valid = CopyGameMotion(view, effective.game_motion, barriers, error);
+        } else {
+            effective.game_motion.valid = false;
+        }
         // The hardware matched this frame against the previous one as soon
         // as the game released it: usable when that previous one is the frame
         // the last Execute generated from.
@@ -4441,6 +4570,16 @@ class D3D12FrameGen final : public FrameGenGpu {
         handle.ptr += static_cast<UINT64>(index) * descriptor_size_;
         return handle;
     }
+
+    struct GameTexture {
+        ComPtr<ID3D12Resource> resource;
+        std::uint64_t generation{0};
+    };
+    std::unordered_map<std::uint64_t, GameTexture> game_textures_; // by the capture DLL's NT handle
+    ComPtr<ID3D12Fence> game_fence_;
+    std::uint64_t game_fence_handle_{0};
+    bool game_motion_failed_{false};
+    std::string game_motion_status_;
 
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_; // the game's (session) queue: captures, and waits before output releases

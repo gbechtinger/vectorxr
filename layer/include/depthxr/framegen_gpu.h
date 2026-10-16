@@ -110,6 +110,8 @@ class FrameGenGpu {
     // when the backend has no depth path).
     virtual XrSwapchainUsageFlags RequiredDepthUsage() const { return 0; }
     virtual bool SupportsDepth() const { return false; }
+    // True when Execute() can consume FrameGenViewRequest::game_motion (shared motion vectors from the game).
+    virtual bool SupportsGameMotion() const { return false; }
     // How the game's depth is being read after checking it against the
     // other eye, with the evidence; counts decisions so callers log each once.
     virtual FrameGenDepthStatus DepthStatus() const { return {}; }

@@ -69,8 +69,13 @@ enum class FrameGenPass : std::uint8_t {
     // motion (FrameGenSynthesisPlan's stale flow), the previous frame's
     // resolved depth on this frame's grid, for its eye-shift map.
     kDepthStale,
+    // Game motion (FrameGenViewRequest::game_motion): the motion vectors the
+    // game gave its upscaler, tried as hypotheses against the luma pair
+    // (head movement taken out) and written as the flow field kFlowUnpack
+    // writes for the optical flow hardware.
+    kFlowGame,
 };
-inline constexpr std::size_t kFrameGenPassCount = 26;
+inline constexpr std::size_t kFrameGenPassCount = 27;
 
 // Logical textures owned per view. History and filtered flow are ping-pong
 // pairs: "newest" is written this submission, "previous" is last
@@ -126,6 +131,9 @@ enum class FrameGenTextureKind : std::uint8_t {
     // kDepthStale's output: the previous frame's resolved depth read where
     // each half-resolution texel's content was in that frame.
     kDepthStale,
+    // The game's motion vectors for the newest frame (kFlowGame's input), as
+    // the game wrote them, at the size of its render target.
+    kGameMotion,
 };
 
 // The flow level the optical flow hardware fills: a 4x4 grid on the
@@ -309,6 +317,30 @@ struct FrameGenViewGeometry {
     float angle_down{0.0f};
 };
 
+// The motion vectors a game gave its upscaler (DLSS) for a view's newest
+// frame, shared by VectorXR's mvcapture library (mvcapture/include/mvcapture/
+// shared.h): from each pixel of the frame to where its content was in the
+// previous frame, in pixels of the game's render target times the scale.
+// Handles are NT handles in this process; `generation` changes whenever the
+// library replaces its textures, so a handle number reused for another
+// texture is never taken for the old one.
+struct FrameGenGameMotion {
+    bool valid{false};
+    std::uint64_t texture{0};     // the shared texture (a Direct3D 11 texture opened here)
+    std::uint64_t fence{0};       // a shared fence signalled once `texture` holds the frame (0: none)
+    std::uint64_t fence_value{0};
+    std::uint64_t generation{0};
+    std::uint32_t width{0};       // the texture's size, and its DXGI format
+    std::uint32_t height{0};
+    std::uint32_t format{0};
+    std::uint32_t render_width{0}; // the region the game rendered into (the whole texture when 0)
+    std::uint32_t render_height{0};
+    std::uint32_t base_x{0};       // where that region starts in the texture
+    std::uint32_t base_y{0};
+    float scale_x{1.0f};           // multiplied into a vector to give pixels toward the previous frame
+    float scale_y{1.0f};
+};
+
 struct FrameGenViewRequest {
     FrameGenExtent extent;
     FrameGenOutputKind output{FrameGenOutputKind::kSrgb8};
@@ -346,6 +378,10 @@ struct FrameGenViewRequest {
     // one rotation and translation fitted to its measured flow, instead of
     // the flow itself (kWorldReduce, kWorldSolve).
     bool world_motion{false};
+    // The game's own motion vectors for the newest frame (set by the
+    // presenter from the capture library; the backend clears `valid` when it
+    // cannot use them, and then measures the motion as before).
+    FrameGenGameMotion game_motion;
 };
 
 struct FrameGenTuning {

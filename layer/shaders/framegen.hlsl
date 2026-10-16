@@ -1756,16 +1756,7 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
 }
 #endif
 
-#if defined(FG_PASS_FLOW_UNPACK)
-FG_BIND(0) Texture2D<int2> g_hardware_flow : register(t0);
-FG_BIND(1) Texture2D<float4> g_luma_current : register(t1);
-FG_BIND(2) Texture2D<float4> g_luma_previous : register(t2);
-FG_BIND(3) Texture2D<float4> g_depth : register(t3);
-FG_BIND(4) FG_FORMAT("rgba16f") RWTexture2D<float4> g_flow : register(u0);
-
-// options.x: the hardware matched the frames as rendered (FG_PASS_FLOW_PACK_RAW).
-#define FG_UNPACK_RAW 1u
-
+#if defined(FG_PASS_FLOW_UNPACK) || defined(FG_PASS_FLOW_GAME)
 // The inverse of MapToPrevious: where a previous-view coordinate lies in the
 // newest view, for content at newest-view depth `depth` (rotation only
 // without it). False behind the newest view.
@@ -1793,6 +1784,17 @@ bool MapToNewest(float2 previous_uv, float depth, out float2 newest_uv) {
                        (tangent.y - g.fov_current.z) / (g.fov_current.w - g.fov_current.z));
     return true;
 }
+#endif
+
+#if defined(FG_PASS_FLOW_UNPACK)
+FG_BIND(0) Texture2D<int2> g_hardware_flow : register(t0);
+FG_BIND(1) Texture2D<float4> g_luma_current : register(t1);
+FG_BIND(2) Texture2D<float4> g_luma_previous : register(t2);
+FG_BIND(3) Texture2D<float4> g_depth : register(t3);
+FG_BIND(4) FG_FORMAT("rgba16f") RWTexture2D<float4> g_flow : register(u0);
+
+// options.x: the hardware matched the frames as rendered (FG_PASS_FLOW_PACK_RAW).
+#define FG_UNPACK_RAW 1u
 
 // The hardware's vectors (S10.5 half-resolution pixels, from the newest
 // frame to the previous one) as flow (previous to newest, normalized), each
@@ -1848,6 +1850,139 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     const float cost = sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
     const float zero = zero_count >= 0.5 * max(count, 1.0) ? zero_sum / zero_count : -1.0;
     g_flow[id.xy] = float4(d / float2(extent), cost, zero);
+}
+#endif
+
+#if defined(FG_PASS_FLOW_GAME)
+FG_BIND(0) Texture2D<float4> g_motion : register(t0);
+FG_BIND(1) Texture2D<float4> g_luma_current : register(t1);
+FG_BIND(2) Texture2D<float4> g_luma_previous : register(t2);
+FG_BIND(3) Texture2D<float4> g_depth : register(t3);
+FG_BIND(4) FG_FORMAT("rgba16f") RWTexture2D<float4> g_flow : register(u0);
+
+// The game's own motion vectors (what it gave its upscaler: from each pixel
+// of the newest frame to where its content was in the previous frame, in
+// pixels of its render target times a scale) turned into the flow field the
+// optical flow hardware's vectors are (FG_PASS_FLOW_UNPACK): one vector per
+// cell, previous to newest frame, normalized, with the luma matching cost
+// and the cost of no motion.
+//
+// The luma pair already has the head's movement taken out (FG_PASS_LUMA), and
+// the game's vectors include it, so each vector is mapped back through the
+// head's movement like the hardware's vectors between frames as rendered
+// (MapToNewest), which leaves the content's own motion.
+//
+// A vector is only a hypothesis: the game's vectors are not defined on glass,
+// particles, the sky or across silhouettes (the upscaler dilates them itself).
+// Each cell tries the vectors at its centre and quadrants, and no motion, and
+// keeps the one that matches the luma best; no motion wins only where it
+// matches clearly better than every one of the game's.
+//
+// tuning.xy: uv of the view per unit of a vector; tuning.zw: the render
+// region in texels; options.x, options.z: its origin in the motion texture;
+// options.w: luma texels per cell side.
+#define FG_GAME_PRIOR 0.02
+#define FG_GAME_SPOTS 5
+static const float2 kGameSpots[FG_GAME_SPOTS] = {float2(0.5, 0.5), float2(0.25, 0.25), float2(0.75, 0.25),
+                                                 float2(0.25, 0.75), float2(0.75, 0.75)};
+
+// The game's vector at newest-view coordinate `uv` as uv of the view toward
+// the previous frame; false where it is not a number or longer than the view.
+bool GameVector(float2 uv, out float2 toward_previous) {
+    toward_previous = float2(0.0, 0.0);
+    uint width, height;
+    g_motion.GetDimensions(width, height);
+    const int2 origin = int2(int(g.options.x), int(g.options.z));
+    const int2 texel = clamp(origin + int2(floor(uv * g.tuning.zw)), int2(0, 0), int2(width, height) - 1);
+    const float2 raw = g_motion.Load(int3(texel, 0)).xy;
+    if (!all(isfinite(raw))) {
+        return false;
+    }
+    toward_previous = raw * g.tuning.xy;
+    return all(abs(toward_previous) < 1.0);
+}
+
+// The cost of the previous frame's content `offset` luma texels back over
+// the block of `scale` x `scale` texels of `cell`, as FG_PASS_FLOW_UNPACK
+// scores a vector.
+float MatchCost(int2 cell, int scale, int2 extent, int2 offset) {
+    float sum = 0.0;
+    float count = 0.0;
+    [loop]
+    for (int y = 0; y < scale; ++y) {
+        [loop]
+        for (int x = 0; x < scale; ++x) {
+            const int2 q = cell * scale + int2(x, y);
+            if (any(q >= extent)) {
+                continue;
+            }
+            const float current = g_luma_current.Load(int3(q, 0)).r;
+            const int2 s = q - offset;
+            const float previous = any(s < 0) || any(s >= extent) ? -1.0 : g_luma_previous.Load(int3(s, 0)).r;
+            sum += previous < 0.0 ? FG_INVALID_PENALTY : abs(current - previous);
+            count += 1.0;
+        }
+    }
+    return sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= g.size.xy)) {
+        return;
+    }
+    uint width, height;
+    g_luma_current.GetDimensions(width, height);
+    const int2 extent = int2(width, height);
+    const float2 extent_f = float2(extent);
+    const int scale = int(g.options.w);
+    const int2 cell = int2(id.xy);
+
+    // The cost of no motion over the texels the previous frame saw, as
+    // FG_PASS_FLOW_UNPACK reports it (w).
+    float zero_sum = 0.0;
+    float zero_count = 0.0;
+    float total = 0.0;
+    [loop]
+    for (int y = 0; y < scale; ++y) {
+        [loop]
+        for (int x = 0; x < scale; ++x) {
+            const int2 q = cell * scale + int2(x, y);
+            if (any(q >= extent)) {
+                continue;
+            }
+            total += 1.0;
+            const float still = g_luma_previous.Load(int3(q, 0)).r;
+            if (still >= 0.0) {
+                zero_sum += abs(g_luma_current.Load(int3(q, 0)).r - still);
+                zero_count += 1.0;
+            }
+        }
+    }
+    const float zero = zero_count >= 0.5 * max(total, 1.0) ? zero_sum / zero_count : -1.0;
+
+    const float no_motion_cost = MatchCost(cell, scale, extent, int2(0, 0));
+    float game_cost = 1.0e9;
+    float2 game_d = float2(0.0, 0.0);
+    const float2 corner = float2(cell * scale);
+    [unroll]
+    for (int i = 0; i < FG_GAME_SPOTS; ++i) {
+        const float2 spot = (corner + kGameSpots[i] * float(scale)) / extent_f;
+        float2 toward_previous;
+        float2 newest_uv;
+        if (!GameVector(spot, toward_previous) ||
+            !MapToNewest(spot + toward_previous, DepthNearest(g_depth, spot), newest_uv)) {
+            continue;
+        }
+        const float2 d = (spot - newest_uv) * extent_f;
+        const float cost = MatchCost(cell, scale, extent, int2(round(d)));
+        if (cost < game_cost) {
+            game_cost = cost;
+            game_d = d;
+        }
+    }
+    const bool use_game = game_cost < 1.0e8 && game_cost <= no_motion_cost + FG_GAME_PRIOR;
+    g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f, use_game ? game_cost : no_motion_cost, zero);
 }
 #endif
 

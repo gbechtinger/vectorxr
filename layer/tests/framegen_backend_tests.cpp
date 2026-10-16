@@ -1375,7 +1375,7 @@ Pixels CockpitAt(std::uint32_t width, std::uint32_t height, float head_x, float 
 const char* const kProfileNames[] = {"luma",        "downsample",  "search",      "refine",      "filter",
                                      "synthesize",  "synthesize16", "depth",      "depth check", "depth trust",
                                      "flow pack",   "flow unpack", "trust update", "shift clear", "shift splat",
-                                     "shift resolve", "shift fill", "raw pack",   "trust resolve", "shading rate", "world reduce", "world solve", "trust vote", "depth scale", "scale vote", "depth stale",
+                                     "shift resolve", "shift fill", "raw pack",   "trust resolve", "shading rate", "world reduce", "world solve", "trust vote", "depth scale", "scale vote", "depth stale", "game flow",
                                      "source copy", "output copy",
                                      "hardware wait", "compose", "flow merge"};
 static_assert(std::size(kProfileNames) == kFrameGenPassCount + 5, "a name per profiled category");

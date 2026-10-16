@@ -5,6 +5,7 @@ project(VectorXR VERSION 0.5.0 LANGUAGES CXX)
 option(DEPTHXR_BUILD_LAYER "Build the Windows OpenXR API layer" ON)
 option(DEPTHXR_BUILD_TESTS "Build VectorXR layer tests" ON)
 option(DEPTHXR_BUILD_HARDWARE_PROBES "Build opt-in real-runtime OpenXR diagnostic clients" OFF)
+option(DEPTHXR_BUILD_MVCAPTURE "Build the experimental DLSS motion vector capture (a dxgi.dll for the game's folder; needs VECTORXR_NGX_SDK_DIR)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,3 +21,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 include(CTest)
 
 add_subdirectory(layer)
+
+if(DEPTHXR_BUILD_MVCAPTURE)
+    add_subdirectory(mvcapture)
+endif()

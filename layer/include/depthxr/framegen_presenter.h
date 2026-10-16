@@ -619,6 +619,15 @@ class FrameGenPresenter {
         std::uint64_t releases{0}; // the swapchain's SwapchainRecord::releases it captured
     };
 
+    // A view's latest game motion vectors (VECTORXR_FRAMEGEN_GAME_MOTION),
+    // read from the capture DLL when its color was released.
+    struct GameMotionSnapshot {
+        XrSwapchain swapchain{XR_NULL_HANDLE};
+        std::uint64_t releases{0}; // the swapchain's releases at that capture
+        std::uint64_t frame_seq{0}; // the capture DLL's count of this slot's DLSS evaluations
+        FrameGenGameMotion motion;
+    };
+
     // An output image per output index: its extent and what it holds.
     struct OutputSpec {
         FrameGenExtent extent;
@@ -1479,6 +1488,9 @@ class FrameGenPresenter {
     std::optional<std::uint64_t> quad_claim_id_; // the ThreadedFrame claimed and not yet ended
     std::array<FrameGenExtent, 4> quad_extents_{};
     std::array<QuadCapture, 4> quad_captures_{};
+    bool game_motion_enabled_{false};
+    bool logged_game_motion_{false};
+    std::array<GameMotionSnapshot, 4> game_snapshots_{};
     // Writing composed frames kept failing: the layer composes them until
     // then (doubling from quad_decline_first_ up to quad_decline_longest_).
     std::chrono::steady_clock::time_point quad_declined_until_{};

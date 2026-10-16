@@ -124,7 +124,7 @@ if(WIN32 AND DEPTHXR_BUILD_LAYER)
     endif()
     set(_framegen_passes LUMA DOWNSAMPLE SEARCH REFINE FILTER SYNTHESIZE_UNORM8 SYNTHESIZE_FLOAT16 DEPTH DEPTH_CHECK DEPTH_TRUST FLOW_PACK FLOW_UNPACK
         TRUST_UPDATE SHIFT_CLEAR SHIFT_SPLAT SHIFT_RESOLVE SHIFT_FILL FLOW_PACK_RAW TRUST_RESOLVE SHADING_RATE WORLD_REDUCE WORLD_SOLVE
-        TRUST_VOTE DEPTH_SCALE DEPTH_SCALE_VOTE DEPTH_STALE)
+        TRUST_VOTE DEPTH_SCALE DEPTH_SCALE_VOTE DEPTH_STALE FLOW_GAME)
     set(_framegen_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/framegen.hlsl")
     set(_framegen_out "${CMAKE_CURRENT_BINARY_DIR}/framegen_shaders")
     file(MAKE_DIRECTORY "${_framegen_out}")
@@ -213,6 +213,7 @@ if(WIN32 AND DEPTHXR_BUILD_LAYER)
         "${_framegen_out}/framegen_shaders.cpp"
         "${_framegen_out}/framegen_flow_merge.h")
     target_include_directories(depthxr_framegen PUBLIC include)
+    target_include_directories(depthxr_framegen PRIVATE "${PROJECT_SOURCE_DIR}/mvcapture/include")
     target_include_directories(depthxr_framegen PRIVATE "${_framegen_out}")
     target_compile_features(depthxr_framegen PUBLIC cxx_std_20)
     # NVIDIA's optical flow accelerator (RTX 20-50) measures motion on

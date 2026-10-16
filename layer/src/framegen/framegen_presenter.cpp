@@ -3,6 +3,7 @@
 #include "depthxr/framegen_presenter.h"
 
 #include "depthxr/logger.h"
+#include "mvcapture/shared.h"
 
 #include <algorithm>
 #include <cmath>
@@ -398,6 +399,11 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
     {
         const char* stale = std::getenv("VECTORXR_FRAMEGEN_STALE_MOTION");
         stale_motion_enabled_ = !(stale && std::string(stale) == "0");
+    }
+    {
+        // The game's own motion vectors (mvcapture's dxgi.dll in the game's folder) instead of measured motion.
+        const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
+        game_motion_enabled_ = game && std::string(game) == "1";
     }
     gpu_frames_ahead_ = 1;
     gpu_timeouts_in_row_ = 0;
@@ -1165,6 +1171,55 @@ bool FrameGenPresenter::TracesSwapchainCalls() const {
     return CapturingLocked();
 }
 
+namespace {
+
+// The capture DLL's newest motion vectors for `view` (its slot: slots are in
+// the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
+// variable exchanges the first two). False when the DLL is not loaded, the
+// slot has nothing new since `last_seq`, or the vectors cannot be used.
+bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq) {
+    static mvcapture::Reader reader;
+    if (!reader.Open()) {
+        return false;
+    }
+    static const bool swap = [] {
+        const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_SWAP");
+        return value && std::string(value) == "1";
+    }();
+    std::uint32_t slot = static_cast<std::uint32_t>(view);
+    if (swap && slot < 2) {
+        slot = 1 - slot;
+    }
+    mvcapture::SlotInfo info{};
+    if (!reader.ReadSlot(slot, info) || info.frame_seq == last_seq) {
+        return false;
+    }
+    seq = info.frame_seq;
+    const std::uint64_t fence = reader.Get()->fence_handle;
+    const std::uint64_t texture = info.ring_index < mvcapture::kRing ? info.mv_handle[info.ring_index] : 0;
+    if (!texture || !fence || info.array_size != 1 || info.reset || info.width == 0 || info.height == 0) {
+        return false;
+    }
+    out = {};
+    out.valid = true;
+    out.texture = texture;
+    out.fence = fence;
+    out.fence_value = info.fence_value;
+    out.generation = info.generation;
+    out.width = info.width;
+    out.height = info.height;
+    out.format = info.mv_format;
+    out.render_width = info.render_width;
+    out.render_height = info.render_height;
+    out.base_x = info.mv_base_x;
+    out.base_y = info.mv_base_y;
+    out.scale_x = info.mv_scale_x != 0.0f ? info.mv_scale_x : 1.0f;
+    out.scale_y = info.mv_scale_y != 0.0f ? info.mv_scale_y : 1.0f;
+    return true;
+}
+
+} // namespace
+
 void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t image_index) {
     auto capturing = [&] {
         if (!CapturingLocked()) {
@@ -1267,6 +1322,28 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
     if (color_captured) {
         if (const auto record = swapchains_.find(swapchain); record != swapchains_.end()) {
             record->second.captured_releases = releases;
+        }
+    }
+    if (game_motion_enabled_) {
+        for (const Job& job : jobs) {
+            if (job.depth || !job.ok || job.view >= game_snapshots_.size()) {
+                continue;
+            }
+            GameMotionSnapshot& snapshot = game_snapshots_[job.view];
+            FrameGenGameMotion motion;
+            std::uint64_t seq = snapshot.frame_seq;
+            const bool fresh = ReadGameMotion(job.view, snapshot.frame_seq, motion, seq);
+            snapshot.swapchain = swapchain;
+            snapshot.releases = releases;
+            snapshot.frame_seq = seq;
+            snapshot.motion = fresh ? motion : FrameGenGameMotion{};
+            if (fresh && logger_ && !logged_game_motion_) {
+                logged_game_motion_ = true;
+                logger_->Info("Frame Generation found the game's motion vectors: " + std::to_string(motion.width) + "x" +
+                              std::to_string(motion.height) + " format " + std::to_string(motion.format) + ", render " +
+                              std::to_string(motion.render_width) + "x" + std::to_string(motion.render_height) +
+                              ", scale " + std::to_string(motion.scale_x) + "," + std::to_string(motion.scale_y));
+            }
         }
     }
     // Each view's latest capture, as Execute matches it (ClaimQuadFrame).
@@ -3545,6 +3622,13 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     depth_record != swapchains_.end() && depth_record->second.depth_capturable;
                 depth_sent_ = true;
                 depth_readable_ = depth_readable_ || (submission.request.depth && gpu_->SupportsDepth());
+            }
+            if (game_motion_enabled_ && gpu_->SupportsGameMotion() && i < game_snapshots_.size()) {
+                const GameMotionSnapshot& snapshot = game_snapshots_[i];
+                if (snapshot.motion.valid && snapshot.swapchain == view.subImage.swapchain &&
+                    snapshot.releases == record->second.captured_releases) {
+                    submission.request.game_motion = snapshot.motion;
+                }
             }
         }
         if (!error.empty()) {
