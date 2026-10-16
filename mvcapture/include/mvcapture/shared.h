@@ -73,6 +73,42 @@ inline void MappingName(DWORD pid, wchar_t (&name)[64]) {
     wsprintfW(name, L"Local\\VectorXR.MvCapture.%lu", pid);
 }
 
+// Optional CPU preview of the motion vectors, for debugging tools (not for the
+// OpenXR layer, which reads the shared textures on the GPU). Enabled with
+// VECTORXR_MVCAPTURE_PREVIEW=1 in the game's environment. A second named
+// mapping, "Local\\VectorXR.MvCapture.Preview.<pid>", holds a header and, per
+// slot, a tightly packed copy of the newest motion vector texture (every few
+// evaluations, a couple of frames late) at kPreviewHeaderBytes + slot * slot_bytes.
+inline constexpr std::uint32_t kPreviewMagic = 0x3150564du; // "MVP1"
+inline constexpr std::uint32_t kPreviewSlots = 2;
+inline constexpr std::uint32_t kPreviewHeaderBytes = 256;
+inline constexpr std::uint32_t kPreviewSlotBytes = 16u * 1024u * 1024u;
+
+struct PreviewSlot {
+    volatile LONG64 sequence;  // seqlock, odd = being written
+    std::uint64_t frame_seq;   // SlotInfo::frame_seq of the evaluation the copy comes from (approximate)
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t format;      // DXGI_FORMAT
+    std::uint32_t bytes_per_pixel;
+    std::uint32_t reserved[4];
+};
+
+struct PreviewHeader {
+    std::uint32_t magic;
+    std::uint32_t version;
+    std::uint32_t header_bytes;
+    std::uint32_t slot_bytes;
+    std::uint32_t slot_count;
+    std::uint32_t reserved[3];
+    PreviewSlot slots[kPreviewSlots];
+};
+static_assert(sizeof(PreviewHeader) <= kPreviewHeaderBytes, "preview header must fit its reserved space");
+
+inline void PreviewMappingName(DWORD pid, wchar_t (&name)[64]) {
+    wsprintfW(name, L"Local\\VectorXR.MvCapture.Preview.%lu", pid);
+}
+
 // Reader side (the OpenXR layer). Header-only so the layer needs no new target.
 class Reader {
   public:

@@ -80,6 +80,13 @@ struct Slot {
     const void* depth_src_key{nullptr};
     ComPtr<ID3D11ShaderResourceView> depth_src_view;
 
+    // CPU preview (VECTORXR_MVCAPTURE_PREVIEW): two staging copies read in turn.
+    ComPtr<ID3D11Texture2D> preview_stage[2];
+    bool preview_pending[2]{};
+    std::uint32_t preview_next{0};
+    std::uint64_t preview_tick{0};
+    D3D11_TEXTURE2D_DESC preview_desc{};
+
     std::uint32_t ring{kRing - 1};
     std::uint64_t frame_seq{0};
     std::uint32_t generation{0}; // bumped whenever the shared motion vector textures are re-created
@@ -99,6 +106,10 @@ struct State {
 
     HANDLE mapping{};
     Block* block{};
+    bool preview{false};
+    bool preview_checked{false};
+    HANDLE preview_mapping{};
+    std::uint8_t* preview_view{};
     Slot slots[kMaxSlots];
 };
 
@@ -470,6 +481,128 @@ bool CaptureMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint
     return true;
 }
 
+std::uint32_t BytesPerPixel(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+        return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32G32_TYPELESS:
+        return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+// The preview mapping, created on first use when VECTORXR_MVCAPTURE_PREVIEW=1.
+bool EnsurePreview(State& s) {
+    if (s.preview_view) {
+        return true;
+    }
+    if (s.preview_checked) {
+        return false;
+    }
+    s.preview_checked = true;
+    wchar_t value[8]{};
+    const DWORD length = GetEnvironmentVariableW(L"VECTORXR_MVCAPTURE_PREVIEW", value, 8);
+    if (!(length == 1 && value[0] == L'1')) {
+        return false;
+    }
+    const std::uint64_t total = std::uint64_t(kPreviewHeaderBytes) + std::uint64_t(kPreviewSlots) * kPreviewSlotBytes;
+    wchar_t name[64];
+    PreviewMappingName(GetCurrentProcessId(), name);
+    s.preview_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(total >> 32),
+                                           static_cast<DWORD>(total & 0xffffffffu), name);
+    if (!s.preview_mapping) {
+        Log("preview: CreateFileMapping failed: %lu", GetLastError());
+        return false;
+    }
+    s.preview_view = static_cast<std::uint8_t*>(MapViewOfFile(s.preview_mapping, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(total)));
+    if (!s.preview_view) {
+        Log("preview: MapViewOfFile failed: %lu", GetLastError());
+        CloseHandle(s.preview_mapping);
+        s.preview_mapping = nullptr;
+        return false;
+    }
+    auto* header = reinterpret_cast<PreviewHeader*>(s.preview_view);
+    std::memset(header, 0, sizeof(PreviewHeader));
+    header->magic = kPreviewMagic;
+    header->version = 1;
+    header->header_bytes = kPreviewHeaderBytes;
+    header->slot_bytes = kPreviewSlotBytes;
+    header->slot_count = kPreviewSlots;
+    s.preview = true;
+    Log("preview: motion vectors are copied to the CPU (every 8th evaluation) for debugging tools");
+    return true;
+}
+
+// Copies the newest vectors to a staging texture, and publishes the copy made
+// the time before (it is done by now, so reading it does not stall the game).
+void PreviewMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t index, std::uint32_t ring) {
+    if (index >= kPreviewSlots || !EnsurePreview(s) || ++slot.preview_tick % 8 != 0) {
+        return;
+    }
+    const D3D11_TEXTURE2D_DESC& desc = slot.mv_desc;
+    const std::uint32_t bpp = BytesPerPixel(desc.Format);
+    if (!bpp || desc.ArraySize != 1 || std::uint64_t(desc.Width) * desc.Height * bpp > kPreviewSlotBytes) {
+        return;
+    }
+    if (!slot.preview_stage[0] || !SameDesc(desc, slot.preview_desc)) {
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC stage = desc;
+        stage.Usage = D3D11_USAGE_STAGING;
+        stage.BindFlags = 0;
+        stage.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        stage.MiscFlags = 0;
+        for (int i = 0; i < 2; ++i) {
+            slot.preview_stage[i].Reset();
+            slot.preview_pending[i] = false;
+            if (!device || FAILED(device->CreateTexture2D(&stage, nullptr, &slot.preview_stage[i]))) {
+                Log("preview: could not create a staging texture (format %u %ux%u)", desc.Format, desc.Width, desc.Height);
+                slot.preview_stage[0].Reset();
+                slot.preview_stage[1].Reset();
+                return;
+            }
+        }
+        slot.preview_desc = desc;
+        slot.preview_next = 0;
+    }
+    // The copy made last time, if the GPU has finished it.
+    const std::uint32_t read = slot.preview_next ^ 1u;
+    if (slot.preview_pending[read]) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(context->Map(slot.preview_stage[read].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+            auto* header = reinterpret_cast<PreviewHeader*>(s.preview_view);
+            PreviewSlot& out = header->slots[index];
+            std::uint8_t* dst = s.preview_view + kPreviewHeaderBytes + std::size_t(index) * kPreviewSlotBytes;
+            InterlockedIncrement64(&out.sequence); // odd: being written
+            MemoryBarrier();
+            const std::size_t row = std::size_t(desc.Width) * bpp;
+            for (UINT y = 0; y < desc.Height; ++y) {
+                std::memcpy(dst + y * row, static_cast<const std::uint8_t*>(mapped.pData) + std::size_t(y) * mapped.RowPitch, row);
+            }
+            out.frame_seq = slot.frame_seq;
+            out.width = desc.Width;
+            out.height = desc.Height;
+            out.format = desc.Format;
+            out.bytes_per_pixel = bpp;
+            MemoryBarrier();
+            InterlockedIncrement64(&out.sequence); // even: published
+            context->Unmap(slot.preview_stage[read].Get(), 0);
+            slot.preview_pending[read] = false;
+        }
+    }
+    context->CopyResource(slot.preview_stage[slot.preview_next].Get(), slot.mv[ring].Get());
+    slot.preview_pending[slot.preview_next] = true;
+    slot.preview_next ^= 1u;
+}
+
 } // namespace
 
 bool Enabled() {
@@ -531,6 +664,8 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Parameter* paramet
     if (!have_mv) {
         return;
     }
+
+    PreviewMotion(s, context, *slot, index, ring);
 
     std::uint64_t fence_value = 0;
     if (s.fence) {

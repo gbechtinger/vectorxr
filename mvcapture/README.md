@@ -71,3 +71,20 @@ luma pair and falls back to zero motion where the vector does not match
 (canopy glass, particles, sky). Only the Direct3D 12 backend uses them; others
 measure the motion as before. If the eyes look swapped, add
 `VECTORXR_FRAMEGEN_GAME_MOTION_SWAP=1`. Depth is not used yet.
+
+## Seeing the vectors (debug preview)
+
+The shared block only holds metadata and GPU handles, so an external program
+cannot read the pixels from it. For debugging, set
+`VECTORXR_MVCAPTURE_PREVIEW=1` in the game's environment: the DLL then copies
+every 8th evaluation's vectors (two eyes) to a second mapping,
+`Local\VectorXR.MvCapture.Preview.<pid>` (layout in `shared.h`, `PreviewHeader`),
+without waiting for the GPU. `tools/mvcapture_viewer.py` shows them (colour =
+direction, brightness = length):
+
+```
+pip install numpy opencv-python psutil
+python mvcapture/tools/mvcapture_viewer.py
+```
+
+Leave the variable unset for normal play: the layer does not use the preview.
