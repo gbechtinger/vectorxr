@@ -1,4 +1,4 @@
-# mvviewer
+#
 
 A small Python script that shows the **motion vectors and depth buffer** that DCS World
 hands to DLSS, live, while the game is running. It is a debugging aid for the
