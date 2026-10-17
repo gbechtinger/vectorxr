@@ -59,8 +59,10 @@ DXGI_FORMAT DepthSrvFormat(DXGI_FORMAT format) {
 struct Slot {
     bool used{false};
     std::uint64_t last_use{0};
-    // Identity of the evaluation stream: only compared, never dereferenced.
-    const void* key_resource{nullptr};
+    // Identity of the evaluation stream: its position among the DLSS evaluations of one frame (0 = first eye
+    // evaluated, 1 = second...). The game recreates its DLSS features (new handles) now and then, so neither the
+    // feature handle nor the motion vector texture can identify an eye for long.
+    std::uint32_t key_ordinal{0};
     UINT key_base_x{0};
     UINT key_base_y{0};
 
@@ -80,17 +82,25 @@ struct Slot {
     const void* depth_src_key{nullptr};
     ComPtr<ID3D11ShaderResourceView> depth_src_view;
 
+<<<<<<< Updated upstream
     // CPU preview (VECTORXR_MVCAPTURE_PREVIEW): two staging copies read in turn.
     ComPtr<ID3D11Texture2D> preview_stage[2];
     bool preview_pending[2]{};
     std::uint32_t preview_next{0};
     std::uint64_t preview_tick{0};
     D3D11_TEXTURE2D_DESC preview_desc{};
+=======
+    // The DLSS feature last seen on this slot (only compared, never dereferenced), to log recreations.
+    const void* feature{nullptr};
+>>>>>>> Stashed changes
 
     std::uint32_t ring{kRing - 1};
     std::uint64_t frame_seq{0};
     std::uint32_t generation{0}; // bumped whenever the shared motion vector textures are re-created
 };
+
+// A slot not evaluated for this many DLSS calls is dead (its stream ended) and is released.
+constexpr std::uint64_t kStaleCalls = 240;
 
 struct State {
     std::mutex mutex;
@@ -112,6 +122,10 @@ struct State {
     HANDLE preview_mapping{};
     std::uint8_t* preview_view{};
     Slot slots[kMaxSlots];
+
+    // Features evaluated since the start of the current round (one round = one frame: every eye once).
+    const void* round_features[kMaxSlots]{};
+    std::uint32_t round_count{0};
 };
 
 State& S() {
@@ -173,6 +187,14 @@ bool InitDevice(State& s, ID3D11Device* device) {
     }
     s.block->slot_count = 0;
     s.block->fence_handle = 0;
+    s.round_count = 0;
+    for (SlotInfo& info : s.block->slots) {
+        info.valid = 0;
+        for (std::uint32_t i = 0; i < kRing; ++i) {
+            info.mv_handle[i] = 0;
+            info.depth_handle[i] = 0;
+        }
+    }
 
     ComPtr<IDXGIDevice> dxgi_device;
     ComPtr<IDXGIAdapter> adapter;
@@ -298,25 +320,53 @@ Inputs ReadInputs(const NVSDK_NGX_Parameter* p) {
     return in;
 }
 
-Slot* FindSlot(State& s, const void* resource, UINT base_x, UINT base_y, std::uint32_t& index) {
+// Unpublishes slot `index` and frees its textures: readers see valid == 0.
+void ReleaseSlot(State& s, std::uint32_t index) {
+    SlotInfo& info = s.block->slots[index];
+    InterlockedIncrement64(&info.sequence); // odd: being written
+    MemoryBarrier();
+    info.valid = 0;
+    for (std::uint32_t i = 0; i < kRing; ++i) {
+        info.mv_handle[i] = 0;
+        info.depth_handle[i] = 0;
+    }
+    MemoryBarrier();
+    InterlockedIncrement64(&info.sequence); // even: published
+    CloseSlot(s.slots[index]);
+    std::uint32_t count = 0;
+    for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
+        if (s.slots[i].used) {
+            count = i + 1;
+        }
+    }
+    s.block->slot_count = count;
+    Log("slot %u released (its stream was not evaluated for %llu calls)", index,
+        static_cast<unsigned long long>(kStaleCalls));
+}
+
+Slot* FindSlot(State& s, std::uint32_t ordinal, const void* feature, UINT base_x, UINT base_y, std::uint32_t& index) {
+    for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
+        Slot& slot = s.slots[i];
+        if (slot.used && slot.key_ordinal == ordinal && slot.key_base_x == base_x && slot.key_base_y == base_y) {
+            index = i;
+            return &slot;
+        }
+    }
     Slot* oldest = nullptr;
     std::uint32_t oldest_index = 0;
     for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
         Slot& slot = s.slots[i];
-        if (slot.used && slot.key_resource == resource && slot.key_base_x == base_x && slot.key_base_y == base_y) {
-            index = i;
-            return &slot;
-        }
         if (!slot.used) {
             index = i;
             slot.used = true;
-            slot.key_resource = resource;
+            slot.key_ordinal = ordinal;
             slot.key_base_x = base_x;
             slot.key_base_y = base_y;
             if (s.block->slot_count < i + 1) {
                 s.block->slot_count = i + 1;
             }
-            Log("new evaluation stream -> slot %u (motion vectors %p, subrect base %u,%u)", i, resource, base_x, base_y);
+            Log("new evaluation stream -> slot %u (evaluation %u of the frame, DLSS feature %p, subrect base %u,%u)", i,
+                ordinal, feature, base_x, base_y);
             return &slot;
         }
         if (!oldest || slot.last_use < oldest->last_use) {
@@ -324,12 +374,11 @@ Slot* FindSlot(State& s, const void* resource, UINT base_x, UINT base_y, std::ui
             oldest_index = i;
         }
     }
-    // All slots are taken by other streams (the game recreated its textures):
-    // reuse the one unused for longest.
-    Log("slot %u reused for motion vectors %p (the game's textures changed)", oldest_index, resource);
+    // All slots are taken by other streams: reuse the one unused for longest.
+    Log("slot %u reused for evaluation %u of the frame (DLSS feature %p)", oldest_index, ordinal, feature);
     CloseSlot(*oldest);
     oldest->used = true;
-    oldest->key_resource = resource;
+    oldest->key_ordinal = ordinal;
     oldest->key_base_x = base_x;
     oldest->key_base_y = base_y;
     index = oldest_index;
@@ -612,7 +661,7 @@ bool Enabled() {
     return !(length > 0 && length < 8 && value[0] == L'0');
 }
 
-void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Parameter* parameters) {
+void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters) {
     if (!context || !parameters) {
         return;
     }
@@ -645,9 +694,10 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Parameter* paramet
     const Inputs in = ReadInputs(parameters);
     const bool verbose = s.calls <= 12 || s.calls % 3000 == 0;
     if (verbose) {
-        Log("evaluate #%llu: mv=%p depth=%p jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d render=%ux%u mvBase=%u,%u "
-            "depthBase=%u,%u",
-            static_cast<unsigned long long>(s.calls), static_cast<void*>(in.mv), static_cast<void*>(in.depth), in.jitter_x,
+        Log("evaluate #%llu: feature=%p mv=%p depth=%p jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d render=%ux%u "
+            "mvBase=%u,%u depthBase=%u,%u",
+            static_cast<unsigned long long>(s.calls), static_cast<const void*>(feature), static_cast<void*>(in.mv),
+            static_cast<void*>(in.depth), in.jitter_x,
             in.jitter_y, in.mv_scale_x, in.mv_scale_y, in.reset, in.render_w, in.render_h, in.mv_base_x, in.mv_base_y,
             in.depth_base_x, in.depth_base_y);
     }
@@ -655,8 +705,34 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Parameter* paramet
         return;
     }
 
+    // Release streams that ended (the game recreated its DLSS features and the old ones are gone).
+    for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
+        if (s.slots[i].used && s.calls - s.slots[i].last_use > kStaleCalls) {
+            ReleaseSlot(s, i);
+        }
+    }
+
+    // Which evaluation of the frame is this? A feature seen twice starts a new round, so the ordinal is 0 for the
+    // first eye, 1 for the second, whatever feature handles and textures the game currently uses.
+    bool repeated = s.round_count >= kMaxSlots;
+    for (std::uint32_t i = 0; !repeated && i < s.round_count; ++i) {
+        repeated = s.round_features[i] == static_cast<const void*>(feature);
+    }
+    if (repeated) {
+        s.round_count = 0;
+    }
+    const std::uint32_t ordinal = s.round_count;
+    s.round_features[s.round_count++] = feature;
+
     std::uint32_t index = 0;
-    Slot* slot = FindSlot(s, in.mv, in.mv_base_x, in.mv_base_y, index);
+    Slot* slot = FindSlot(s, ordinal, feature, in.mv_base_x, in.mv_base_y, index);
+    if (slot->feature != static_cast<const void*>(feature)) {
+        if (slot->feature) {
+            Log("slot %u: DLSS feature changed %p -> %p (the game recreated it)", index, slot->feature,
+                static_cast<const void*>(feature));
+        }
+        slot->feature = feature;
+    }
     slot->last_use = s.calls;
     const std::uint32_t ring = (slot->ring + 1) % kRing;
 

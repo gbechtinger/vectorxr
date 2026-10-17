@@ -22,7 +22,7 @@ EvaluateFn g_original = nullptr;
 NVSDK_NGX_Result NVSDK_CONV EvaluateDetour(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* handle,
                                             const NVSDK_NGX_Parameter* parameters, PFN_NVSDK_NGX_ProgressCallback callback) {
     try {
-        OnEvaluate(context, parameters);
+        OnEvaluate(context, handle, parameters);
     } catch (...) {
         // Capture must never change what the game sees.
     }

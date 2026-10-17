@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 4.3)
+
 # VectorXR motion vector capture: a dxgi.dll proxy for the game's folder that
 # hooks DLSS (NVSDK_NGX_D3D11_EvaluateFeature) and shares the motion vectors and
 # depth DLSS reads. See README.md.
@@ -9,12 +11,12 @@ endif()
 # NVIDIA's NGX headers are under the NVIDIA RTX SDKs licence, which does not
 # allow redistributing them from this repository: point this at a local clone
 # of https://github.com/NVIDIA/DLSS (its include/ folder is used).
-set(VECTORXR_NGX_SDK_DIR "" CACHE PATH "Local clone of https://github.com/NVIDIA/DLSS (for include/nvsdk_ngx.h)")
-if(NOT EXISTS "${VECTORXR_NGX_SDK_DIR}/include/nvsdk_ngx.h")
-    message(FATAL_ERROR
-        "DEPTHXR_BUILD_MVCAPTURE needs VECTORXR_NGX_SDK_DIR set to a clone of https://github.com/NVIDIA/DLSS "
-        "(include/nvsdk_ngx.h was not found under '${VECTORXR_NGX_SDK_DIR}')")
-endif()
+#set(VECTORXR_NGX_SDK_DIR "" CACHE PATH "Local clone of https://github.com/NVIDIA/DLSS (for include/nvsdk_ngx.h)")
+#if(NOT EXISTS "${VECTORXR_NGX_SDK_DIR}/include/nvsdk_ngx.h")
+#    message(FATAL_ERROR
+#        "DEPTHXR_BUILD_MVCAPTURE needs VECTORXR_NGX_SDK_DIR set to a clone of https://github.com/NVIDIA/DLSS "
+#        "(include/nvsdk_ngx.h was not found under '${VECTORXR_NGX_SDK_DIR}')")
+#endif()
 
 include(FetchContent)
 # MinHook v1.3.4 (BSD-2-Clause), pinned by commit.
@@ -31,8 +33,7 @@ add_library(vectorxr_mvcapture SHARED
 target_compile_features(vectorxr_mvcapture PRIVATE cxx_std_20)
 target_include_directories(vectorxr_mvcapture PRIVATE
     src
-    include
-    "${VECTORXR_NGX_SDK_DIR}/include")
+    include)
 target_link_libraries(vectorxr_mvcapture PRIVATE minhook shell32 user32)
 
 # The game loads this file as its own dxgi.dll. Its import library must not
