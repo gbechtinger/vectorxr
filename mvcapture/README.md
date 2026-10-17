@@ -62,8 +62,10 @@ fence before reading `ring_index`'s textures.
 
 ## Using the vectors in VectorXR frame generation (stage 1)
 
-With `dxgi.dll` from this project next to the game's executable, set
-`VECTORXR_FRAMEGEN_GAME_MOTION=1` before starting the game. Frame generation
+With `dxgi.dll` from this project next to the game's executable, nothing else
+is needed: the layer finds the DLL's shared block by itself and uses the game's
+motion vectors. Without the DLL it measures the motion as before.
+`VECTORXR_FRAMEGEN_GAME_MOTION=0` turns it off even with the DLL. Frame generation
 then builds its flow field from the game's DLSS motion vectors (one slot per
 eye, in the order the game's DLSS evaluations first run) instead of the
 optical flow hardware/shader search; each cell is still verified against the

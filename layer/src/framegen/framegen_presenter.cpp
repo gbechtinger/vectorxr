@@ -402,8 +402,10 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
     }
     {
         // The game's own motion vectors (mvcapture's dxgi.dll in the game's folder) instead of measured motion.
+        // Automatic: without that DLL in the game the layer measures the motion as before.
+        // VECTORXR_FRAMEGEN_GAME_MOTION=0 turns it off even with the DLL.
         const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
-        game_motion_enabled_ = game && std::string(game) == "1";
+        game_motion_enabled_ = !(game && std::string(game) == "0");
         // Experiments: FORCE keeps the best game vector even where no motion
         // matches the images better; FLIP reverses the vectors' direction.
         const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
@@ -1178,15 +1180,29 @@ bool FrameGenPresenter::TracesSwapchainCalls() const {
 
 namespace {
 
+// True once the capture DLL's block has been found in this process.
+bool g_game_motion_dll_seen = false;
+
 // The capture DLL's newest motion vectors for `view` (its slot: slots are in
 // the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
 // variable exchanges the first two). False when the DLL is not loaded, the
 // slot has nothing new since `last_seq`, or the vectors cannot be used.
 bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq) {
     static mvcapture::Reader reader;
-    if (!reader.Open()) {
-        return false;
+    // The DLL publishes its block at the game's first DLSS evaluation, so keep
+    // looking for it, but only once a second while it is absent.
+    static Clock::time_point next_try{};
+    if (!reader.Get()) {
+        const auto now = Clock::now();
+        if (now < next_try) {
+            return false;
+        }
+        if (!reader.Open()) {
+            next_try = now + std::chrono::seconds(1);
+            return false;
+        }
     }
+    g_game_motion_dll_seen = true;
     static const bool swap = [] {
         const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_SWAP");
         return value && std::string(value) == "1";
@@ -3635,7 +3651,7 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     submission.request.game_motion = snapshot.motion;
                     submission.request.game_motion.flags = game_motion_flags_;
                     ++game_motion_sent_;
-                } else {
+                } else if (g_game_motion_dll_seen) {
                     ++game_motion_missing_;
                 }
             }
@@ -5735,7 +5751,7 @@ void FrameGenPresenter::SummaryLocked(Clock::time_point now) {
             (gpu_gate_enabled_ && gpu_gate_armed_ ? "" : gpu_gate_enabled_ ? " (not armed)" : " (off)") +
             ", endCallMs=" + MedianAndMax(end_call_ms_) + ", runtimeEndMs=" + MedianAndMax(runtime_end_ms_) +
             ", synthLockMs=" + MedianAndMax(synth_lock_ms_) +
-            (game_motion_enabled_
+            (game_motion_enabled_ && g_game_motion_dll_seen
                  ? ", gameMotion=" + std::to_string(game_motion_sent_ - game_motion_reported_sent_) + "/" +
                        std::to_string(game_motion_missing_ - game_motion_reported_missing_) +
                        (game_motion_flags_ ? " flags=" + std::to_string(game_motion_flags_) : std::string())
