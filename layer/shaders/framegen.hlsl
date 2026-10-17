@@ -1899,6 +1899,9 @@ bool GameVector(float2 uv, out float2 toward_previous) {
         return false;
     }
     toward_previous = raw * g.tuning.xy;
+    if ((g.options.y & 2u) != 0u) {
+        toward_previous = -toward_previous;
+    }
     return all(abs(toward_previous) < 1.0);
 }
 
@@ -1981,7 +1984,8 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
             game_d = d;
         }
     }
-    const bool use_game = game_cost < 1.0e8 && game_cost <= no_motion_cost + FG_GAME_PRIOR;
+    const bool force_game = (g.options.y & 1u) != 0u;
+    const bool use_game = game_cost < 1.0e8 && (force_game || game_cost <= no_motion_cost + FG_GAME_PRIOR);
     g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f, use_game ? game_cost : no_motion_cost, zero);
 }
 #endif

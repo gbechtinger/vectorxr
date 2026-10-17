@@ -112,6 +112,8 @@ class FrameGenGpu {
     virtual bool SupportsDepth() const { return false; }
     // True when Execute() can consume FrameGenViewRequest::game_motion (shared motion vectors from the game).
     virtual bool SupportsGameMotion() const { return false; }
+    // Why the game's motion vectors stopped being usable (empty while they are).
+    virtual std::string GameMotionStatus() const { return {}; }
     // How the game's depth is being read after checking it against the
     // other eye, with the evidence; counts decisions so callers log each once.
     virtual FrameGenDepthStatus DepthStatus() const { return {}; }

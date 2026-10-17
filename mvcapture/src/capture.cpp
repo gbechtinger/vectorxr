@@ -101,6 +101,7 @@ struct State {
     ComPtr<ID3D11Fence> fence;
     HANDLE fence_handle{};
     std::uint64_t fence_value{0};
+    std::uint32_t generation_counter{0}; // never reused: a reader may cache by handle value, which Windows reuses
     ComPtr<ID3D11ComputeShader> depth_shader;
     bool depth_shader_failed{false};
 
@@ -454,7 +455,7 @@ bool CaptureMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint
         return false;
     }
     if (!SameDesc(desc, slot.mv_desc) || !slot.mv[0]) {
-        ++slot.generation;
+        slot.generation = ++s.generation_counter;
         for (std::uint32_t i = 0; i < kRing; ++i) {
             if (slot.mv_handle[i]) {
                 CloseHandle(slot.mv_handle[i]);

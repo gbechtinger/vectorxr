@@ -339,6 +339,10 @@ struct FrameGenGameMotion {
     std::uint32_t base_y{0};
     float scale_x{1.0f};           // multiplied into a vector to give pixels toward the previous frame
     float scale_y{1.0f};
+    // Experiments (environment variables of the presenter): bit 0 keeps the
+    // best of the game's vectors even where no motion matches better, bit 1
+    // reverses their direction.
+    std::uint32_t flags{0};
 };
 
 struct FrameGenViewRequest {

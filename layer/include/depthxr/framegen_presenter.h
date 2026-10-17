@@ -1489,6 +1489,12 @@ class FrameGenPresenter {
     std::array<FrameGenExtent, 4> quad_extents_{};
     std::array<QuadCapture, 4> quad_captures_{};
     bool game_motion_enabled_{false};
+    std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
+    std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
+    std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)
+    std::uint64_t game_motion_reported_sent_{0};
+    std::uint64_t game_motion_reported_missing_{0};
+    std::string game_motion_logged_status_;
     bool logged_game_motion_{false};
     std::array<GameMotionSnapshot, 4> game_snapshots_{};
     // Writing composed frames kept failing: the layer composes them until

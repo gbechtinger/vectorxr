@@ -831,6 +831,7 @@ class D3D12FrameGen final : public FrameGenGpu {
 
     bool SupportsDepth() const override { return true; }
     bool SupportsGameMotion() const override { return true; }
+    std::string GameMotionStatus() const override { return game_motion_status_; }
     XrSwapchainUsageFlags RequiredDepthUsage() const override { return XR_SWAPCHAIN_USAGE_SAMPLED_BIT; }
 
     // The plane-0 view of a depth format, readable in a shader.
@@ -4138,11 +4139,12 @@ class D3D12FrameGen final : public FrameGenGpu {
     // process. Either output may be null to just check. False when they
     // cannot be used, with a one-time log.
     bool OpenGameMotion(const FrameGenGameMotion& motion, ID3D12Resource** resource, ID3D12Fence** fence) {
-        if (game_motion_failed_ || !motion.texture || !motion.fence) {
+        if (submission_ < game_motion_retry_ || !motion.texture || !motion.fence) {
             return false;
         }
         auto fail = [&](const char* what, HRESULT hr) {
-            game_motion_failed_ = true; // not retried every frame
+            game_motion_retry_ = submission_ + 120; // not retried every frame, but not for good
+            ++game_motion_failures_;
             char text[160];
             std::snprintf(text, sizeof(text), "game motion vectors unusable (%s, 0x%08lx)", what, static_cast<unsigned long>(hr));
             game_motion_status_ = text;
@@ -4177,7 +4179,11 @@ class D3D12FrameGen final : public FrameGenGpu {
             }
             found = game_textures_.emplace(motion.texture, std::move(entry)).first;
         }
-        if (!game_fence_ || game_fence_handle_ != motion.fence) {
+        // A handle value is reused by Windows, so the fence is also reopened
+        // when the capture DLL made new textures (a new generation) or its
+        // values went back (a new fence counts from the start).
+        if (!game_fence_ || game_fence_handle_ != motion.fence || game_fence_generation_ != motion.generation ||
+            motion.fence_value < game_fence_value_) {
             ComPtr<ID3D12Fence> opened;
             const HRESULT hr = device_->OpenSharedHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(motion.fence)),
                                                          IID_PPV_ARGS(&opened));
@@ -4186,7 +4192,9 @@ class D3D12FrameGen final : public FrameGenGpu {
             }
             game_fence_ = opened;
             game_fence_handle_ = motion.fence;
+            game_fence_generation_ = motion.generation;
         }
+        game_fence_value_ = motion.fence_value;
         if (resource) *resource = found->second.resource.Get();
         if (fence) *fence = game_fence_.Get();
         return true;
@@ -4578,7 +4586,10 @@ class D3D12FrameGen final : public FrameGenGpu {
     std::unordered_map<std::uint64_t, GameTexture> game_textures_; // by the capture DLL's NT handle
     ComPtr<ID3D12Fence> game_fence_;
     std::uint64_t game_fence_handle_{0};
-    bool game_motion_failed_{false};
+    std::uint64_t game_fence_generation_{0};
+    std::uint64_t game_fence_value_{0};
+    std::uint64_t game_motion_retry_{0}; // submission count before which the vectors are not tried again
+    std::uint32_t game_motion_failures_{0};
     std::string game_motion_status_;
 
     ComPtr<ID3D12Device> device_;

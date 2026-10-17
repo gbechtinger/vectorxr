@@ -404,6 +404,11 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         // The game's own motion vectors (mvcapture's dxgi.dll in the game's folder) instead of measured motion.
         const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
         game_motion_enabled_ = game && std::string(game) == "1";
+        // Experiments: FORCE keeps the best game vector even where no motion
+        // matches the images better; FLIP reverses the vectors' direction.
+        const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
+        const char* flip = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FLIP");
+        game_motion_flags_ = (force && std::string(force) == "1" ? 1u : 0u) | (flip && std::string(flip) == "1" ? 2u : 0u);
     }
     gpu_frames_ahead_ = 1;
     gpu_timeouts_in_row_ = 0;
@@ -3628,6 +3633,10 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 if (snapshot.motion.valid && snapshot.swapchain == view.subImage.swapchain &&
                     snapshot.releases == record->second.captured_releases) {
                     submission.request.game_motion = snapshot.motion;
+                    submission.request.game_motion.flags = game_motion_flags_;
+                    ++game_motion_sent_;
+                } else {
+                    ++game_motion_missing_;
                 }
             }
         }
@@ -3698,6 +3707,14 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
         }
         const auto execute_start = Clock::now();
         ok = ok && gpu_->Execute(submissions, tuning, executed, error);
+        if (game_motion_enabled_) {
+            // Under the GPU lock, as the backend writes it.
+            const std::string status = gpu_->GameMotionStatus();
+            if (!status.empty() && status != game_motion_logged_status_) {
+                game_motion_logged_status_ = status;
+                if (logger_) logger_->Info("Frame Generation: " + status);
+            }
+        }
         execute_ms = Milliseconds(Clock::now() - execute_start);
         if (gpu_) {
             gpu_ms = gpu_->LastGpuMilliseconds();
@@ -5718,6 +5735,11 @@ void FrameGenPresenter::SummaryLocked(Clock::time_point now) {
             (gpu_gate_enabled_ && gpu_gate_armed_ ? "" : gpu_gate_enabled_ ? " (not armed)" : " (off)") +
             ", endCallMs=" + MedianAndMax(end_call_ms_) + ", runtimeEndMs=" + MedianAndMax(runtime_end_ms_) +
             ", synthLockMs=" + MedianAndMax(synth_lock_ms_) +
+            (game_motion_enabled_
+                 ? ", gameMotion=" + std::to_string(game_motion_sent_ - game_motion_reported_sent_) + "/" +
+                       std::to_string(game_motion_missing_ - game_motion_reported_missing_) +
+                       (game_motion_flags_ ? " flags=" + std::to_string(game_motion_flags_) : std::string())
+                 : std::string()) +
             (jit_ ? ", justInTime=1, covers=" + std::to_string(jit_covers_) + ", unwritten=" +
                         std::to_string(delta(&Totals::unwritten_wait)) + "/" +
                         std::to_string(delta(&Totals::unwritten_failed)) + "/" +
@@ -5773,6 +5795,8 @@ void FrameGenPresenter::NewSummaryWindowLocked(Clock::time_point now, double sta
     shift_window_sum_mm_ = shift_window_max_mm_ = 0.0;
     shift_window_frames_ = 0;
     jit_covers_ = 0;
+    game_motion_reported_sent_ = game_motion_sent_;
+    game_motion_reported_missing_ = game_motion_missing_;
 }
 
 bool FrameGenPresenter::AnalyzeJit(const XrCompositionLayerProjection& projection, const PendingFrame& frame,
