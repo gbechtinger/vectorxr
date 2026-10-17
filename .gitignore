@@ -35,3 +35,4 @@ local-signing/
 logs/
 
 out/
+.vs/
