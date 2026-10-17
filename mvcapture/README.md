@@ -84,7 +84,7 @@ direction, brightness = length):
 
 ```
 pip install numpy opencv-python psutil
-python mvcapture/tools/mvcapture_viewer.py
+python mvviewer/view.py
 ```
 
 Leave the variable unset for normal play: the layer does not use the preview.
