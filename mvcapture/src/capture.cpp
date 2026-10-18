@@ -82,17 +82,15 @@ struct Slot {
     const void* depth_src_key{nullptr};
     ComPtr<ID3D11ShaderResourceView> depth_src_view;
 
-<<<<<<< Updated upstream
     // CPU preview (VECTORXR_MVCAPTURE_PREVIEW): two staging copies read in turn.
     ComPtr<ID3D11Texture2D> preview_stage[2];
     bool preview_pending[2]{};
     std::uint32_t preview_next{0};
     std::uint64_t preview_tick{0};
     D3D11_TEXTURE2D_DESC preview_desc{};
-=======
+
     // The DLSS feature last seen on this slot (only compared, never dereferenced), to log recreations.
     const void* feature{nullptr};
->>>>>>> Stashed changes
 
     std::uint32_t ring{kRing - 1};
     std::uint64_t frame_seq{0};
@@ -446,6 +444,7 @@ bool CaptureDepth(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint3
         }
         slot.depth_desc = desc;
         slot.depth_converted = convert;
+        slot.generation = ++s.generation_counter; // new depth handles: readers must not reuse cached ones
         Log("shared depth: %ux%u format %u %s", desc.Width, desc.Height, desc.Format,
             convert ? "(converted from a depth-stencil texture to R32_FLOAT, raw buffer values)" : "(copied as written)");
     }
