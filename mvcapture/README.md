@@ -90,3 +90,12 @@ python mvviewer/view.py
 ```
 
 Leave the variable unset for normal play: the layer does not use the preview.
+
+## Using the game's depth (optional, off by default)
+
+DLSS does not tell the capture DLL the camera's near/far planes, so the layer cannot use the depth on its own.
+Set `VECTORXR_FRAMEGEN_GAME_DEPTH=<near>[,<far>]` (meters; far omitted = infinite, `1` alone = near 0.2 m) in the
+environment of the VR app **and** of the game, then restart both. It only applies when the game submits no depth
+layer to OpenXR. Raw depth may be reversed (near stored as 1): the layer's depth validator tries both. If the log shows
+`Frame Generation uses the game's depth from the capture DLL`, it is active; compare views with the depth debug tools
+and tune `<near>` if the depth looks scaled.
