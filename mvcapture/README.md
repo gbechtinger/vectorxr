@@ -62,10 +62,8 @@ fence before reading `ring_index`'s textures.
 
 ## Using the vectors in VectorXR frame generation (stage 1)
 
-With `dxgi.dll` from this project next to the game's executable, nothing else
-is needed: the layer finds the DLL's shared block by itself and uses the game's
-motion vectors. Without the DLL it measures the motion as before.
-`VECTORXR_FRAMEGEN_GAME_MOTION=0` turns it off even with the DLL. Frame generation
+With `dxgi.dll` from this project next to the game's executable, set
+`VECTORXR_FRAMEGEN_GAME_MOTION=1` before starting the game. Frame generation
 then builds its flow field from the game's DLSS motion vectors (one slot per
 eye, in the order the game's DLSS evaluations first run) instead of the
 optical flow hardware/shader search; each cell is still verified against the
@@ -90,12 +88,3 @@ python mvviewer/view.py
 ```
 
 Leave the variable unset for normal play: the layer does not use the preview.
-
-## Using the game's depth (optional, off by default)
-
-DLSS does not tell the capture DLL the camera's near/far planes, so the layer cannot use the depth on its own.
-Set `VECTORXR_FRAMEGEN_GAME_DEPTH=<near>[,<far>]` (meters; far omitted = infinite, `1` alone = near 0.2 m) in the
-environment of the VR app **and** of the game, then restart both. It only applies when the game submits no depth
-layer to OpenXR. Raw depth may be reversed (near stored as 1): the layer's depth validator tries both. If the log shows
-`Frame Generation uses the game's depth from the capture DLL`, it is active; compare views with the depth debug tools
-and tune `<near>` if the depth looks scaled.
