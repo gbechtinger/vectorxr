@@ -626,7 +626,6 @@ class FrameGenPresenter {
         std::uint64_t releases{0}; // the swapchain's releases at that capture
         std::uint64_t frame_seq{0}; // the capture DLL's count of this slot's DLSS evaluations
         FrameGenGameMotion motion;
-        bool depth{false}; // the capture DLL's depth was linearized into the view's depth for this capture
     };
 
     // An output image per output index: its extent and what it holds.
@@ -1501,8 +1500,6 @@ class FrameGenPresenter {
     std::uint64_t game_motion_reported_missing_{0};
     std::string game_motion_logged_status_;
     bool logged_game_motion_{false};
-    bool logged_game_depth_{false};
-    bool logged_game_depth_failure_{false};
     std::array<GameMotionSnapshot, 4> game_snapshots_{};
     // Writing composed frames kept failing: the layer composes them until
     // then (doubling from quad_decline_first_ up to quad_decline_longest_).
