@@ -636,6 +636,8 @@ class FrameGenPresenter {
     };
 
     bool WantsEngagementLocked() const;
+    // False while VECTORXR_FRAMEGEN_GAME_MOTION_ONLY asks for the game's motion vectors and none arrive.
+    bool GameMotionAvailableLocked() const;
     // Frames are generated or about to be: the game's releases are captured.
     bool CapturingLocked() const;
     // The state while no frame is engaged: off when turned off, else waiting.
@@ -1490,6 +1492,7 @@ class FrameGenPresenter {
     std::array<FrameGenExtent, 4> quad_extents_{};
     std::array<QuadCapture, 4> quad_captures_{};
     bool game_motion_enabled_{false};
+    bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
     std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
     std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
     std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)

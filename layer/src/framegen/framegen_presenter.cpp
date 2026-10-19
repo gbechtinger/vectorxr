@@ -408,6 +408,10 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         // VECTORXR_FRAMEGEN_GAME_MOTION=0 turns it off even with the DLL.
         const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
         game_motion_enabled_ = !(game && std::string(game) == "0");
+        // ONLY: generate frames only while the game's DLSS evaluations arrive (see GameMotionFlowing); menus and
+        // screens without a DLSS session pass straight through. Without the capture DLL nothing is ever generated.
+        const char* only = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_ONLY");
+        game_motion_only_ = only && std::string(only) == "1";
         // Experiments: FORCE keeps the best game vector even where no motion
         // matches the images better; FLIP reverses the vectors' direction.
         const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
@@ -1185,15 +1189,15 @@ namespace {
 // True once the capture DLL's block has been found in this process.
 bool g_game_motion_dll_seen = false;
 
-// The capture DLL's newest motion vectors for `view` (its slot: slots are in
-// the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
-// variable exchanges the first two). False when the DLL is not loaded, the
-// slot has nothing new since `last_seq`, or the vectors cannot be used.
-bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq,
-                    FrameGenGameMotion* depth_out = nullptr) {
+mvcapture::Reader& GameMotionReader() {
     static mvcapture::Reader reader;
-    // The DLL publishes its block at the game's first DLSS evaluation, so keep
-    // looking for it, but only once a second while it is absent.
+    return reader;
+}
+
+// Opens the capture DLL's block once it exists. The DLL publishes it at the game's first DLSS evaluation, so keep
+// looking for it, but only once a second while it is absent.
+bool OpenGameMotionReader() {
+    mvcapture::Reader& reader = GameMotionReader();
     static Clock::time_point next_try{};
     if (!reader.Get()) {
         const auto now = Clock::now();
@@ -1206,6 +1210,66 @@ bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion
         }
     }
     g_game_motion_dll_seen = true;
+    return true;
+}
+
+// VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1: whether the game's DLSS evaluations are arriving. False once none has been
+// seen for a second (menus, loading screens, anything without a DLSS session: the vectors the layer works from are
+// gone), and again true only after a run of new evaluations, so a stray one does not switch generation back on.
+// Called with the presenter's lock held; polls the shared block at most every 50 ms.
+bool GameMotionFlowing() {
+    constexpr auto kPoll = std::chrono::milliseconds(50);
+    constexpr auto kSilence = std::chrono::seconds(1);
+    constexpr std::uint64_t kResume = 20; // new evaluations needed to resume
+    static Clock::time_point checked{};
+    static Clock::time_point moved = Clock::now();
+    static std::uint64_t latest = 0;
+    static std::uint64_t at_stop = 0;
+    static bool flowing = false;
+    const auto now = Clock::now();
+    if (now - checked < kPoll) {
+        return flowing;
+    }
+    checked = now;
+    std::uint64_t seq = 0;
+    if (OpenGameMotionReader()) {
+        const mvcapture::Reader& reader = GameMotionReader();
+        for (std::uint32_t i = 0; i < mvcapture::kMaxSlots; ++i) {
+            mvcapture::SlotInfo info{};
+            if (reader.ReadSlot(i, info)) {
+                seq = std::max(seq, info.frame_seq);
+            }
+        }
+    }
+    if (seq != latest) {
+        // A smaller value is a new block (the game restarted its DLSS): count from there.
+        if (seq < latest) {
+            at_stop = 0;
+        }
+        latest = seq;
+        moved = now;
+    }
+    if (flowing) {
+        if (now - moved >= kSilence) {
+            flowing = false;
+            at_stop = latest;
+        }
+    } else if (latest > at_stop + kResume && now - moved < kSilence) {
+        flowing = true;
+    }
+    return flowing;
+}
+
+// The capture DLL's newest motion vectors for `view` (its slot: slots are in
+// the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
+// variable exchanges the first two). False when the DLL is not loaded, the
+// slot has nothing new since `last_seq`, or the vectors cannot be used.
+bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq,
+                    FrameGenGameMotion* depth_out = nullptr) {
+    if (!OpenGameMotionReader()) {
+        return false;
+    }
+    const mvcapture::Reader& reader = GameMotionReader();
     static const bool swap = [] {
         const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_SWAP");
         return value && std::string(value) == "1";
@@ -1693,7 +1757,26 @@ bool FrameGenPresenter::RunnableLocked() const {
 bool FrameGenPresenter::WantsEngagementLocked() const {
     // Never from display times that do not advance with the time: refreshes
     // presented from them would never reach the game's frames.
-    return RunnableLocked() && EffectiveMultiplierLocked() >= 2 && !QuadDeclinedLocked() && !clock_displaced_;
+    return RunnableLocked() && EffectiveMultiplierLocked() >= 2 && !QuadDeclinedLocked() && !clock_displaced_ &&
+           GameMotionAvailableLocked();
+}
+
+bool FrameGenPresenter::GameMotionAvailableLocked() const {
+    if (!(game_motion_enabled_ && game_motion_only_)) {
+        return true;
+    }
+    static bool last = false;
+    const bool flowing = GameMotionFlowing();
+    if (flowing != last) {
+        last = flowing;
+        if (logger_) {
+            logger_->Info(flowing ? "Frame Generation: the game's DLSS evaluations arrive; frames are generated "
+                                    "(VECTORXR_FRAMEGEN_GAME_MOTION_ONLY)."
+                                  : "Frame Generation: no DLSS evaluation from the game for 1 s; frames pass straight "
+                                    "through until they return (VECTORXR_FRAMEGEN_GAME_MOTION_ONLY).");
+        }
+    }
+    return flowing;
 }
 
 FrameGenState FrameGenPresenter::IdleStateLocked() const {
@@ -1711,7 +1794,7 @@ bool FrameGenPresenter::StayThreadedLocked() const {
     const bool same_mode = !jit_ || jit_interpolate_ == (settings_.synthesis_mode == FrameGenSynthesisMode::kInterpolate);
     return started_ && gpu_ && user_enabled_ && configured_enabled_ && state_ != FrameGenState::kPaused &&
            state_ != FrameGenState::kUnavailable && EffectiveMultiplierLocked() >= 2 && same_mode &&
-           !quad_switch_pending_ && !QuadDeclinedLocked() && !clock_displaced_;
+           !quad_switch_pending_ && !QuadDeclinedLocked() && !clock_displaced_ && GameMotionAvailableLocked();
 }
 
 bool FrameGenPresenter::ThreadedEligibleLocked() const {
