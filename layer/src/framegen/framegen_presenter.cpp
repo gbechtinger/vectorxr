@@ -409,7 +409,8 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
         game_motion_enabled_ = !(game && std::string(game) == "0");
         // ONLY: generate frames only while the game's DLSS evaluations arrive (see GameMotionFlowing); menus and
-        // screens without a DLSS session pass straight through. Without the capture DLL nothing is ever generated.
+        // screens without a DLSS session show the game's frames as they are, with no engaging or disengaging.
+        // Without the capture DLL nothing is ever generated.
         const char* only = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_ONLY");
         game_motion_only_ = only && std::string(only) == "1";
         // Experiments: FORCE keeps the best game vector even where no motion
@@ -1215,7 +1216,7 @@ bool OpenGameMotionReader() {
 
 // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1: whether the game's DLSS evaluations are arriving. False once none has been
 // seen for a second (menus, loading screens, anything without a DLSS session: the vectors the layer works from are
-// gone), and again true only after a run of new evaluations, so a stray one does not switch generation back on.
+// gone; frames are then shown as they are, without leaving the engaged state), and again true only after a run of new evaluations, so a stray one does not switch generation back on.
 // Called with the presenter's lock held; polls the shared block at most every 50 ms.
 bool GameMotionFlowing() {
     constexpr auto kPoll = std::chrono::milliseconds(50);
@@ -1757,8 +1758,7 @@ bool FrameGenPresenter::RunnableLocked() const {
 bool FrameGenPresenter::WantsEngagementLocked() const {
     // Never from display times that do not advance with the time: refreshes
     // presented from them would never reach the game's frames.
-    return RunnableLocked() && EffectiveMultiplierLocked() >= 2 && !QuadDeclinedLocked() && !clock_displaced_ &&
-           GameMotionAvailableLocked();
+    return RunnableLocked() && EffectiveMultiplierLocked() >= 2 && !QuadDeclinedLocked() && !clock_displaced_;
 }
 
 bool FrameGenPresenter::GameMotionAvailableLocked() const {
@@ -1772,8 +1772,8 @@ bool FrameGenPresenter::GameMotionAvailableLocked() const {
         if (logger_) {
             logger_->Info(flowing ? "Frame Generation: the game's DLSS evaluations arrive; frames are generated "
                                     "(VECTORXR_FRAMEGEN_GAME_MOTION_ONLY)."
-                                  : "Frame Generation: no DLSS evaluation from the game for 1 s; frames pass straight "
-                                    "through until they return (VECTORXR_FRAMEGEN_GAME_MOTION_ONLY).");
+                                  : "Frame Generation: no DLSS evaluation from the game for 1 s; the game's frames are "
+                                    "shown as they are until they return (VECTORXR_FRAMEGEN_GAME_MOTION_ONLY).");
         }
     }
     return flowing;
@@ -1794,7 +1794,7 @@ bool FrameGenPresenter::StayThreadedLocked() const {
     const bool same_mode = !jit_ || jit_interpolate_ == (settings_.synthesis_mode == FrameGenSynthesisMode::kInterpolate);
     return started_ && gpu_ && user_enabled_ && configured_enabled_ && state_ != FrameGenState::kPaused &&
            state_ != FrameGenState::kUnavailable && EffectiveMultiplierLocked() >= 2 && same_mode &&
-           !quad_switch_pending_ && !QuadDeclinedLocked() && !clock_displaced_ && GameMotionAvailableLocked();
+           !quad_switch_pending_ && !QuadDeclinedLocked() && !clock_displaced_;
 }
 
 bool FrameGenPresenter::ThreadedEligibleLocked() const {
@@ -3772,7 +3772,10 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 submission.request.output = OutputKindLocked(i, record->second.format).value_or(*kind);
             }
             submission.request.newest = Geometry(view);
-            submission.request.synthesize = continuous && last_real_.views[i].extent.width == submission.request.extent.width &&
+            // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY: without the game's vectors nothing is measured or moved; the real
+            // frames are shown as they are (as at a pause), and generation goes on when the vectors return.
+            submission.request.synthesize = continuous && GameMotionAvailableLocked() &&
+                                            last_real_.views[i].extent.width == submission.request.extent.width &&
                                             last_real_.views[i].extent.height == submission.request.extent.height;
             submission.request.previous = submission.request.synthesize ? last_real_.views[i].geometry : Geometry(view);
             submission.request.temporal = true;

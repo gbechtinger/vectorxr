@@ -636,7 +636,8 @@ class FrameGenPresenter {
     };
 
     bool WantsEngagementLocked() const;
-    // False while VECTORXR_FRAMEGEN_GAME_MOTION_ONLY asks for the game's motion vectors and none arrive.
+    // False while VECTORXR_FRAMEGEN_GAME_MOTION_ONLY asks for the game's motion vectors and none arrive: frames are
+    // then shown as they are (Generate does not synthesize), the presenter staying engaged.
     bool GameMotionAvailableLocked() const;
     // Frames are generated or about to be: the game's releases are captured.
     bool CapturingLocked() const;

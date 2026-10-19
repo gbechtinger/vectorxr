@@ -91,7 +91,9 @@ Leave the variable unset for normal play: the layer does not use the preview.
 
 ## Generating frames only while DLSS runs (optional, off by default)
 
-`VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1` (in the environment of the VR app and the game) makes Frame Generation work only
-while the game's DLSS evaluations arrive. After 1 s without one (menus, loading screens, anything without a DLSS
-session) frames pass straight through, at full quality, and generation resumes once about twenty new evaluations have
-come in. The log says when it switches. Without the capture DLL nothing is generated with this option on.
+`VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1` (in the environment of the VR app and the game) makes Frame Generation generate
+frames only while the game's DLSS evaluations arrive. After 1 s without one (menus, the map, loading screens, anything
+without a DLSS session) the game's frames are shown as they are, with no interpolation and no optical flow, at full
+quality. Frame Generation stays engaged meanwhile (so the game is still paced at half the refresh rate and nothing
+switches on or off), and generation resumes once about twenty new evaluations have come in. The log says when it
+switches. Without the capture DLL nothing is generated with this option on.
