@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <limits>
+#include <optional>
 #include <tuple>
 
 namespace depthxr {
@@ -1263,7 +1265,8 @@ bool GameMotionFlowing() {
 // the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
 // variable exchanges the first two). False when the DLL is not loaded, the
 // slot has nothing new since `last_seq`, or the vectors cannot be used.
-bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq) {
+bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq,
+                    FrameGenGameMotion* depth_out = nullptr) {
     if (!OpenGameMotionReader()) {
         return false;
     }
@@ -1301,7 +1304,48 @@ bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion
     out.base_y = info.mv_base_y;
     out.scale_x = info.mv_scale_x != 0.0f ? info.mv_scale_x : 1.0f;
     out.scale_y = info.mv_scale_y != 0.0f ? info.mv_scale_y : 1.0f;
+    if (depth_out) {
+        // The depth of the same evaluation, in the same ring slot and behind the same fence.
+        *depth_out = {};
+        const std::uint64_t depth = info.depth_handle[info.ring_index];
+        if (depth && info.depth_format) {
+            *depth_out = out;
+            depth_out->texture = depth;
+            depth_out->format = info.depth_format;
+            depth_out->base_x = info.depth_base_x;
+            depth_out->base_y = info.depth_base_y;
+        }
+    }
     return true;
+}
+
+// VECTORXR_FRAMEGEN_GAME_DEPTH=<near>[,<far>]: use the depth the capture DLL shares as the view's depth, when the game
+// submits none to OpenXR. DLSS gives neither near nor far, so they are given here in meters (far omitted or 0:
+// infinite; "1" alone: near 0.2 m). Raw values may be reversed (near at 1): the depth validator tries both.
+const std::optional<FrameGenDepthEncoding>& GameDepthEncoding() {
+    static const std::optional<FrameGenDepthEncoding> encoding = []() -> std::optional<FrameGenDepthEncoding> {
+        const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_DEPTH");
+        if (!value || !*value || std::string(value) == "0") {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        float near_z = std::strtof(value, &end);
+        float far_z = 0.0f;
+        if (end && *end == ',') {
+            far_z = std::strtof(end + 1, nullptr);
+        }
+        if (!(near_z > 0.0f) || near_z == 1.0f) {
+            near_z = std::string(value) == "1" ? 0.2f : near_z;
+        }
+        if (!(near_z > 0.0f)) {
+            return std::nullopt;
+        }
+        if (!(far_z > near_z)) {
+            far_z = std::numeric_limits<float>::infinity();
+        }
+        return FrameGenDepthEncoding{0.0f, 1.0f, near_z, far_z};
+    }();
+    return encoding;
 }
 
 } // namespace
@@ -1417,12 +1461,29 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
             }
             GameMotionSnapshot& snapshot = game_snapshots_[job.view];
             FrameGenGameMotion motion;
+            FrameGenGameMotion depth;
             std::uint64_t seq = snapshot.frame_seq;
-            const bool fresh = ReadGameMotion(job.view, snapshot.frame_seq, motion, seq);
+            const bool fresh = ReadGameMotion(job.view, snapshot.frame_seq, motion, seq, &depth);
             snapshot.swapchain = swapchain;
             snapshot.releases = releases;
             snapshot.frame_seq = seq;
             snapshot.motion = fresh ? motion : FrameGenGameMotion{};
+            snapshot.depth = false;
+            if (fresh && depth.valid && GameDepthEncoding() && gpu_->SupportsGameDepth() &&
+                !std::any_of(jobs.begin(), jobs.end(),
+                             [&](const Job& other) { return other.depth && other.view == job.view; })) {
+                std::string depth_error;
+                snapshot.depth = gpu_->CaptureGameDepth(job.view, depth, *GameDepthEncoding(), job.request, depth_error);
+                if (snapshot.depth && logger_ && !logged_game_depth_) {
+                    logged_game_depth_ = true;
+                    logger_->Info("Frame Generation uses the game's depth from the capture DLL: format " +
+                                  std::to_string(depth.format) + ", near " + std::to_string(GameDepthEncoding()->near_z) +
+                                  ", far " + std::to_string(GameDepthEncoding()->far_z));
+                } else if (!snapshot.depth && !depth_error.empty() && logger_ && !logged_game_depth_failure_) {
+                    logged_game_depth_failure_ = true;
+                    logger_->Error("Frame Generation could not read the game's depth: " + depth_error);
+                }
+            }
             if (fresh && logger_ && !logged_game_motion_) {
                 logged_game_motion_ = true;
                 logger_->Info("Frame Generation found the game's motion vectors: " + std::to_string(motion.width) + "x" +
@@ -3729,6 +3790,14 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     depth_record != swapchains_.end() && depth_record->second.depth_capturable;
                 depth_sent_ = true;
                 depth_readable_ = depth_readable_ || (submission.request.depth && gpu_->SupportsDepth());
+            }
+            if (!submission.request.depth && game_motion_enabled_ && i < game_snapshots_.size() &&
+                game_snapshots_[i].depth && game_snapshots_[i].swapchain == view.subImage.swapchain &&
+                game_snapshots_[i].releases == record->second.captured_releases) {
+                // The game's own depth (from the capture DLL), already linearized by CaptureGameDepth.
+                submission.request.depth = true;
+                depth_sent_ = true;
+                depth_readable_ = true;
             }
             if (game_motion_enabled_ && gpu_->SupportsGameMotion() && i < game_snapshots_.size()) {
                 const GameMotionSnapshot& snapshot = game_snapshots_[i];
