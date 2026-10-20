@@ -498,6 +498,10 @@ class D3D12FrameGen final : public FrameGenGpu {
         if (const char* fade = std::getenv("VECTORXR_FRAMEGEN_CROSSFADE")) {
             cross_fade_ = std::string(fade) == "1";
         }
+        // Research: VECTORXR_FRAMEGEN_CONFIDENCE_FACTORS=1 splits the confidence view by factor.
+        if (const char* factors = std::getenv("VECTORXR_FRAMEGEN_CONFIDENCE_FACTORS")) {
+            confidence_factors_ = std::string(factors) == "1";
+        }
         if (!software && coarse_tangent_ > 0.0 &&
             SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &options6, sizeof(options6))) &&
             options6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
@@ -1848,6 +1852,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         FrameGenTuning effective_tuning = tuning;
         effective_tuning.occlusion = tuning.occlusion && occlusion_;
         effective_tuning.cross_fade = tuning.cross_fade || cross_fade_;
+        effective_tuning.confidence_factors = tuning.confidence_factors || confidence_factors_;
         // The game's own motion vectors replace the optical flow hardware
         // when every view has them (a view without them would otherwise
         // need the hardware's session as well).
@@ -4763,6 +4768,7 @@ class D3D12FrameGen final : public FrameGenGpu {
     bool world_motion_{true};                       // FrameGenViewRequest::world_motion where depth is in use
     bool occlusion_{true};                          // FrameGenTuning::occlusion allowed
     bool cross_fade_{false};                        // FrameGenTuning::cross_fade forced (research)
+    bool confidence_factors_{false};                // FrameGenTuning::confidence_factors forced (research)
     std::array<FrameSlot, kFramesInFlight> slots_;
     ComPtr<ID3D12GraphicsCommandList> capture_commands_;
     std::array<CaptureSlot, kCaptureSlots> capture_slots_; // views x frames in flight, color and depth

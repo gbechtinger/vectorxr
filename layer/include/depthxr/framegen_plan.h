@@ -182,6 +182,9 @@ inline constexpr std::uint32_t kFrameGenFlagCrossFade = 512u;
 // Synthesis, extrapolating: the previous real frame's flow, read where the
 // content was in that frame (BuildFrameGenSynthesisPlan's `stale_flow`).
 inline constexpr std::uint32_t kFrameGenFlagStaleFlow = 1024u;
+// The confidence view shows each factor of the trust on its own colour
+// (FrameGenTuning::confidence_factors, research).
+inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 2048u;
 // World motion: samples per side of the fit's grid, and its iterations.
 inline constexpr std::uint32_t kFrameGenWorldGrid = 128u;
 // The trust vote's tile side in half-resolution texels (FG_TRUST_TILE):
@@ -425,6 +428,8 @@ struct FrameGenTuning {
     // Research: where interpolated motion is not trusted, fade between the
     // two real frames instead of showing the newest one.
     bool cross_fade{false};
+    // Research: the confidence view splits the trust by factor (colours: see Synthesize).
+    bool confidence_factors{false};
     // Quad views: how each eye is composed from its views, for the flow
     // merge and the focus views' motion limit; null on the canvas path. Not
     // owned: the caller keeps it alive for the Execute call.

@@ -72,6 +72,8 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 // frame's own motion is not measured yet), read where each pixel's content
 // was in that frame by head rotation alone.
 #define FG_FLAG_STALE_FLOW 1024u
+// The confidence view shows each factor of the trust on its own colour.
+#define FG_FLAG_CONFIDENCE_FACTORS 2048u
 
 // Linear depth at or beyond this many meters is treated as infinitely far.
 #define FG_FAR_DEPTH 100000.0
@@ -1281,8 +1283,19 @@ float4 Synthesize(float2 position, float fraction) {
             result.rgb = lerp(result.rgb, tint, 0.6 * saturate(magnitude * 4.0));
         }
     } else if (view == FG_VIEW_CONFIDENCE) {
-        const float trust = confidence * photometric_confidence;
-        result.rgb = lerp(result.rgb, float3(1.0, 0.1, 0.05), 0.75 * (1.0 - trust));
+        if ((g.options.y & FG_FLAG_CONFIDENCE_FACTORS) != 0u) {
+            // One colour per factor, brighter the lower it is: red, the two real frames disagree (or, extrapolating
+            // at a boundary, the agreement); green, the filter's trust in the motion; blue, the motion exceeds the
+            // limit; white, the flow's matching cost. Untouched where every factor is high.
+            const float3 factors = saturate(float3(1.0 - photometric_confidence, 1.0 - chosen.w, 1.0 - motion_confidence));
+            const float cost = 1.0 - cost_confidence;
+            const float3 tint = saturate(factors + cost);
+            const float strength = max(max(factors.x, factors.y), max(factors.z, cost));
+            result.rgb = lerp(result.rgb, tint, 0.85 * strength);
+        } else {
+            const float trust = confidence * photometric_confidence;
+            result.rgb = lerp(result.rgb, float3(1.0, 0.1, 0.05), 0.75 * (1.0 - trust));
+        }
     } else if (view == FG_VIEW_TINT) {
         result.rgb *= float3(1.0, 0.8, 1.0);
     }
