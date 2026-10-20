@@ -97,3 +97,14 @@ without a DLSS session) the game's frames are shown as they are, with no interpo
 quality. Frame Generation stays engaged meanwhile (so the game is still paced at half the refresh rate and nothing
 switches on or off), and generation resumes once about twenty new evaluations have come in. The log says when it
 switches. Without the capture DLL nothing is generated with this option on.
+
+## Capturing DLSS's output (optional, off by default)
+
+`VECTORXR_MVCAPTURE_OUTPUT=1` in the game's environment makes the DLL also copy the image DLSS writes (its `Output`
+parameter) right after each evaluation returns, before the game draws anything over it (HUD, displays, menus, a
+helmet-mounted display). Compared with the image the game finally submits, it shows where those things are.
+
+It lives in its own mapping, `Local\VectorXR.MvCapture.Output.<pid>` (`OutputBlock` in `mvcapture/shared.h`, read with
+`OutputReader`), so the main block and everything that reads it stay as they are. Slots are the main block's slots, and
+the textures are ordered by the same shared fence. It costs a copy of the full output image per evaluation and video
+memory for three of them per eye, which is why it is opt-in. Nothing in the layer reads it yet.

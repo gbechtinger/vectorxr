@@ -73,6 +73,45 @@ inline void MappingName(DWORD pid, wchar_t (&name)[64]) {
     wsprintfW(name, L"Local\\VectorXR.MvCapture.%lu", pid);
 }
 
+// Optional: what DLSS wrote. The game draws some things (HUD, displays, menus, a helmet-mounted display) over
+// DLSS's output afterwards, so the output as it was when the evaluation returned, compared with the image the game
+// finally submits, tells where those things are. It costs a copy of the full output image per evaluation and
+// video memory for three of them per slot, so it is off unless VECTORXR_MVCAPTURE_OUTPUT=1 is set in the game's
+// environment. It lives in its own mapping, "Local\\VectorXR.MvCapture.Output.<pid>", so the main block, and
+// readers that know nothing of it, are unchanged. Slots are the same as the main block's: output.slots[i] belongs
+// to the evaluation stream of Block::slots[i], `frame_seq` is that slot's frame_seq for the evaluation, and the
+// textures are ordered by the same shared fence (Block::fence_handle), which reaches `fence_value` when the copy
+// is done. The textures have the output's own format (shader-resource only).
+inline constexpr std::uint32_t kOutputMagic = 0x3143564fu; // "OVC1"
+inline constexpr std::uint32_t kOutputVersion = 1;
+
+struct OutputSlot {
+    volatile LONG64 sequence;  // seqlock, odd = being written
+    std::uint32_t valid;       // 1 once published
+    std::uint32_t ring_index;  // handle[ring_index] holds the newest output
+    std::uint64_t frame_seq;   // SlotInfo::frame_seq of the evaluation it comes from
+    std::uint64_t fence_value; // the shared fence reaches this when the copy is done
+    std::uint64_t handle[kRing]; // NT handles of shared textures (0 when not captured)
+    std::uint32_t width;       // texels
+    std::uint32_t height;
+    std::uint32_t format;      // DXGI_FORMAT of the shared texture
+    std::uint32_t array_size;
+    std::uint32_t generation;  // changes whenever the shared textures are re-created (never reused)
+    std::uint32_t reserved;
+};
+
+struct OutputBlock {
+    std::uint32_t magic;
+    std::uint32_t version;
+    std::uint32_t size;       // sizeof(OutputBlock)
+    std::uint32_t slot_count;
+    OutputSlot slots[kMaxSlots];
+};
+
+inline void OutputMappingName(DWORD pid, wchar_t (&name)[64]) {
+    wsprintfW(name, L"Local\\VectorXR.MvCapture.Output.%lu", pid);
+}
+
 // Optional CPU preview of the motion vectors, for debugging tools (not for the
 // OpenXR layer, which reads the shared textures on the GPU). Enabled with
 // VECTORXR_MVCAPTURE_PREVIEW=1 in the game's environment. A second named
@@ -172,6 +211,70 @@ class Reader {
   private:
     HANDLE mapping_{nullptr};
     const Block* block_{nullptr};
+};
+
+// Reader side of the output mapping; same rules as Reader.
+class OutputReader {
+  public:
+    ~OutputReader() { Close(); }
+
+    // False when the DLL is not loaded or VECTORXR_MVCAPTURE_OUTPUT is not set in the game.
+    bool Open() {
+        if (block_) {
+            return true;
+        }
+        wchar_t name[64];
+        OutputMappingName(GetCurrentProcessId(), name);
+        mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+        if (!mapping_) {
+            return false;
+        }
+        block_ = static_cast<const OutputBlock*>(MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, sizeof(OutputBlock)));
+        if (!block_ || block_->magic != kOutputMagic || block_->version != kOutputVersion ||
+            block_->size != sizeof(OutputBlock)) {
+            Close();
+            return false;
+        }
+        return true;
+    }
+
+    void Close() {
+        if (block_) {
+            UnmapViewOfFile(block_);
+            block_ = nullptr;
+        }
+        if (mapping_) {
+            CloseHandle(mapping_);
+            mapping_ = nullptr;
+        }
+    }
+
+    const OutputBlock* Get() const { return block_; }
+
+    bool ReadSlot(std::uint32_t index, OutputSlot& out) const {
+        if (!block_ || index >= kMaxSlots) {
+            return false;
+        }
+        const OutputSlot& slot = block_->slots[index];
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const LONG64 before = slot.sequence;
+            MemoryBarrier();
+            if (before & 1) {
+                continue;
+            }
+            out = slot;
+            MemoryBarrier();
+            if (slot.sequence == before && out.valid) {
+                out.sequence = before;
+                return true;
+            }
+        }
+        return false;
+    }
+
+  private:
+    HANDLE mapping_{nullptr};
+    const OutputBlock* block_{nullptr};
 };
 
 } // namespace mvcapture

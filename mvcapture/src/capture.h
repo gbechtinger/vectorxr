@@ -21,6 +21,12 @@ namespace mvcapture {
 // It is only compared, never dereferenced.
 void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters);
 
+// Called from the same hook after the real NVSDK_NGX_D3D11_EvaluateFeature returned, on the game's thread. When
+// VECTORXR_MVCAPTURE_OUTPUT=1 is set, copies the image DLSS wrote (its "Output" parameter) into shared textures and
+// publishes them in the output mapping (shared.h, OutputBlock) for the evaluation OnEvaluate just published. Does
+// nothing otherwise. Never throws.
+void OnEvaluateDone(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters);
+
 // VECTORXR_MVCAPTURE=0 turns capture off (the DLL still forwards DXGI).
 bool Enabled();
 
