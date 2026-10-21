@@ -109,6 +109,12 @@ It lives in its own mapping, `Local\VectorXR.MvCapture.Output.<pid>` (`OutputBlo
 the textures are ordered by the same shared fence. It costs a copy of the full output image per evaluation and video
 memory for three of them per eye, which is why it is opt-in. Nothing in the layer reads it yet.
 
+With `VECTORXR_MVCAPTURE_OUTPUT=1` the DLL also keeps the game's output texture of each evaluation and copies it again at
+the start of the same slot's next evaluation (the "late" copy, `OutputSlot::post_*`, output mapping version 2). If the
+game draws its HUD, displays and menus on that texture before tone mapping, the late copy has them and its difference
+from the copy made right after DLSS is exactly the overlay, in the same linear colour space. `mvviewer`'s `c` key shows
+both copies and their difference. The late copy of a frame is only there once the next evaluation of that eye begins.
+
 ## Seeing what the game drew after DLSS (research)
 
 With `VECTORXR_MVCAPTURE_OUTPUT=1` in the game and `VECTORXR_FRAMEGEN_OVERLAY_VIEW=1` in the VR app's environment,

@@ -45,7 +45,7 @@ python view.py
 | Key       | Action                                              |
 |-----------|-----------------------------------------------------|
 | `d`       | Toggle motion vectors / depth                       |
-| `c`       | Show / hide DLSS's output (needs `VECTORXR_MVCAPTURE_OUTPUT=1` in the game) |
+| `c`       | Cycle: DLSS's output right after DLSS, the same texture copied again at the next evaluation (late: what the game drew on it), the difference between the two, back to vectors (needs `VECTORXR_MVCAPTURE_OUTPUT=1` in the game) |
 | `+` / `-` | Change the magnitude that saturates brightness (MV) |
 | `i`       | Invert the colormap (depth)                         |
 | `l`       | Switch between the latest and previous ring entry   |

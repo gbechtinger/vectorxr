@@ -83,7 +83,7 @@ inline void MappingName(DWORD pid, wchar_t (&name)[64]) {
 // textures are ordered by the same shared fence (Block::fence_handle), which reaches `fence_value` when the copy
 // is done. The textures have the output's own format (shader-resource only).
 inline constexpr std::uint32_t kOutputMagic = 0x3143564fu; // "OVC1"
-inline constexpr std::uint32_t kOutputVersion = 1;
+inline constexpr std::uint32_t kOutputVersion = 2;
 
 struct OutputSlot {
     volatile LONG64 sequence;  // seqlock, odd = being written
@@ -98,6 +98,17 @@ struct OutputSlot {
     std::uint32_t array_size;
     std::uint32_t generation;  // changes whenever the shared textures are re-created (never reused)
     std::uint32_t reserved;
+    // The same texture DLSS wrote, copied again at the start of the slot's NEXT evaluation, after the game drew over
+    // it for the frame (if it draws on that texture at all): `post_frame_seq` is the evaluation it belongs to (the
+    // one before `frame_seq`, once the next one has begun), `post_ring` the entry of its textures; the fence reaches
+    // `post_fence_value` when the copy is done. Same format and size as the output.
+    std::uint64_t post_handle[kRing];
+    std::uint64_t post_frame_seq;
+    std::uint64_t post_fence_value;
+    std::uint32_t post_ring;
+    std::uint32_t post_valid;  // 1 once a late copy has been published
+    std::uint32_t post_generation;
+    std::uint32_t post_reserved;
 };
 
 struct OutputBlock {

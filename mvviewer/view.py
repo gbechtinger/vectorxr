@@ -12,7 +12,9 @@ Fluxo:
 Requisitos:  pip install numpy opencv-python
 Uso:         python mv_viewer.py [pid] [--max 4.0] [--zoom 1.0] [--latest]
 Teclas:      d      alterna motion vectors <-> depth
-             c      mostra/esconde a saida do DLSS (antes do HUD, MFDs, menus); precisa de
+             c      percorre: saida do DLSS logo apos o DLSS -> a mesma textura copiada de novo na
+                    avaliacao seguinte (tardia: mostra o que o jogo desenhou nela) -> diferenca entre
+                    as duas (onde o jogo desenhou) -> volta aos vetores; precisa de
                     VECTORXR_MVCAPTURE_OUTPUT=1 no ambiente do DCS e do dxgi.dll novo
              + / -  muda a magnitude que satura o brilho (modo MV)
              i      inverte o colormap (modo depth)
@@ -44,10 +46,10 @@ RING = 3
 # slot_count e 4 OutputSlot de 80 bytes (sequence, valid, ring, frame_seq, fence, handle[3], w, h, fmt, array,
 # generation, reserved).
 OUT_HEADER_FMT = "<IIII"
-OUT_SLOT_FMT = "<QIIQQ3Q6I"
+OUT_SLOT_FMT = "<QIIQQ3Q6I3QQQ4I"  # + a segunda copia ("tardia"): post_handle[3], post_frame_seq, post_fence, post_ring, post_valid, post_generation, reservado
 OUT_SLOT_BASE = 16
-OUT_SLOT_SIZE = 80
-OUT_BLOCK_SIZE = 16 + 4 * 80
+OUT_SLOT_SIZE = 136
+OUT_BLOCK_SIZE = 16 + 4 * 136
 MAX_SLOTS = (BLOCK_SIZE - SLOT_BASE) // SLOT_SIZE  # 4
 
 # DXGI_FORMAT -> (nome, dtype numpy, canais, divisor para normalizar)
@@ -279,7 +281,9 @@ class Capture:
             if s1 == s2:
                 f = struct.unpack(OUT_SLOT_FMT, raw)
                 return {"valid": f[1], "ring": f[2], "frame_seq": f[3], "fence": f[4], "output_handle": f[5:8],
-                        "width": f[8], "height": f[9], "format": f[10], "array": f[11], "generation": f[12]}
+                        "width": f[8], "height": f[9], "format": f[10], "array": f[11], "generation": f[12],
+                        "post_handle": f[13:16], "post_seq": f[16], "post_fence": f[17], "post_ring": f[18],
+                        "post_valid": f[19], "post_generation": f[20]}
         return None
 
     def header(self):
@@ -307,6 +311,8 @@ class Capture:
     def _sig(info, kind):
         if kind == "output":
             return (kind, info["width"], info["height"], info["format"], info["generation"])
+        if kind == "post":
+            return (kind, info["width"], info["height"], info["format"], info["post_generation"])
         return (kind, info["width"], info["height"], info["mv_fmt"], info["depth_fmt"], info["depth_conv"])
 
     def _open(self, key, remote, info, kind):
@@ -340,7 +346,7 @@ class Capture:
                            "tex": tex.value, "stg": stg.value,
                            "w": desc.Width, "h": desc.Height, "fmt": desc.Format}
 
-    def grab(self, slot, info, ring, kind="mv"):
+    def grab(self, slot, info, ring, kind="mv", raw=False):
         """kind='mv': float32 (H, W, 2) em pixels (antes do mv_scale).
         kind='depth': float32 (H, W) com os valores crus do buffer de profundidade."""
         remote = info[kind + "_handle"][ring]
@@ -354,17 +360,17 @@ class Capture:
             ent = self.cache[key]
 
         self.last_fmt = ent["fmt"]
-        if kind == "output":
+        if kind in ("output", "post"):
             fmt = ("output",)
         else:
             fmt = FORMATS.get(ent["fmt"])
         if not fmt:
             raise RuntimeError(f"formato DXGI {ent['fmt']} nao suportado; adicione em FORMATS")
-        if kind != "output":
+        if kind not in ("output", "post"):
             _, dtype, ch, div = fmt
 
-        if kind == "output":
-            return self._read_output(ent)
+        if kind in ("output", "post"):
+            return self._read_output(ent, raw)
         vcall(self.ctx, CTX_CopyResource, [ctypes.c_void_p, ctypes.c_void_p], ent["stg"], ent["tex"], restype=None)
         m = MAPPED()
         hr = vcall(self.ctx, CTX_Map,
@@ -387,8 +393,9 @@ class Capture:
 
 
 # ---------------------------------------------------------- visualizacao ----
-def _read_output(self, ent):
-    """Copia a saida do DLSS para a CPU e devolve uint8 BGR (H, W, 3) pronto para o OpenCV."""
+def _read_output(self, ent, raw=False):
+    """Copia a saida do DLSS para a CPU e devolve uint8 BGR (H, W, 3) pronto para o OpenCV
+    (ou, com raw=True, (rgb float32 sem corte, linear?) para comparar duas copias)."""
     fmt_id = ent["fmt"]
     packed = fmt_id in PACKED_OUTPUT_FORMATS
     spec = OUTPUT_FORMATS.get(fmt_id)
@@ -422,7 +429,10 @@ def _read_output(self, ent):
                 rgb = rgb[:, :, ::-1]
     finally:
         vcall(self.ctx, CTX_Unmap, [ctypes.c_void_p, ctypes.c_uint], ent["stg"], 0, restype=None)
-    rgb = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
+    if raw:
+        return rgb, linear
+    rgb = np.clip(rgb, 0.0, 1.0)
     if linear:
         rgb = rgb ** (1.0 / 2.2)
     return np.ascontiguousarray((rgb[:, :, ::-1] * 255.0 + 0.5).astype(np.uint8))
@@ -495,32 +505,61 @@ def main():
             info = cap.read_slot(i)
             if not info or not info["valid"]:
                 continue
-            if mode == "output":
+            if mode in ("output", "late", "diff"):
                 oinfo = cap.read_output_slot(i)
+
+                def message(lines):
+                    msg = np.zeros((120, 640, 3), np.uint8)
+                    for n, t in enumerate(lines):
+                        cv2.putText(msg, t, (8, 40 + 24 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                                    cv2.LINE_AA)
+                    return msg
+
+                problem = None
                 if not oinfo or not oinfo["valid"]:
-                    if i not in last or last[i][2] != ("sem saida", mode):
-                        msg = np.zeros((120, 640, 3), np.uint8)
-                        for n, t in enumerate([f"slot {i}: sem captura da saida do DLSS",
-                                               "o DCS precisa de VECTORXR_MVCAPTURE_OUTPUT=1 e do dxgi.dll novo"]):
-                            cv2.putText(msg, t, (8, 40 + 24 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
-                                        cv2.LINE_AA)
-                        last[i] = (-1, msg, ("sem saida", mode))
+                    problem = [f"slot {i}: sem captura da saida do DLSS",
+                               "o DCS precisa de VECTORXR_MVCAPTURE_OUTPUT=1 e do dxgi.dll novo"]
+                elif mode != "output" and not oinfo["post_valid"]:
+                    problem = [f"slot {i}: sem a copia tardia da saida (ainda)",
+                               "ela aparece na avaliacao seguinte do DLSS; precisa do dxgi.dll novo"]
+                elif mode == "diff" and not 0 <= oinfo["frame_seq"] - oinfo["post_seq"] <= 2:
+                    problem = [f"slot {i}: as duas copias estao fora de sincronia",
+                               f"saida {oinfo['frame_seq']}, tardia {oinfo['post_seq']}"]
+                if problem:
+                    if i not in last or last[i][2] != ("problema", mode, problem[0]):
+                        last[i] = (-1, message(problem), ("problema", mode, problem[0]))
                     tiles.append(last[i][1])
                     continue
-                if i not in last or last[i][0] != oinfo["frame_seq"] or last[i][2] != ("saida", mode):
-                    ring = oinfo["ring"] if use_latest else (oinfo["ring"] - 1) % RING
+                identity = (oinfo["frame_seq"], oinfo["post_seq"])
+                if i not in last or last[i][0] != identity or last[i][2] != ("saida", mode):
                     try:
-                        img = cap.grab(i, oinfo, ring, "output")
+                        if mode == "output":
+                            ring = oinfo["ring"] if use_latest else (oinfo["ring"] - 1) % RING
+                            img = cap.grab(i, oinfo, ring, "output")
+                            title = f"SAIDA DLSS (logo apos o DLSS) slot {i}  frame {oinfo['frame_seq']}"
+                        elif mode == "late":
+                            img = cap.grab(i, oinfo, oinfo["post_ring"], "post")
+                            title = f"SAIDA DLSS (tardia, antes da proxima avaliacao) slot {i}  frame {oinfo['post_seq']}"
+                        else:
+                            delta = oinfo["frame_seq"] - oinfo["post_seq"]
+                            early, linear = cap.grab(i, oinfo, (oinfo["ring"] - delta) % RING, "output", raw=True)
+                            late, _ = cap.grab(i, oinfo, oinfo["post_ring"], "post", raw=True)
+                            diff = np.abs(late - early).max(axis=2)
+                            changed = float((diff > 1e-3).mean())
+                            level = np.clip(diff * 8.0, 0.0, 1.0) ** (1.0 / 2.2)
+                            img = cv2.applyColorMap((level * 255.0).astype(np.uint8), cv2.COLORMAP_INFERNO)
+                            title = (f"DIFERENCA tardia - logo apos o DLSS, slot {i}  frame {oinfo['post_seq']}  "
+                                     f"{changed * 100:.2f}% dos pixels mudaram")
                     except Exception as e:
                         print(f"slot {i}: {e}")
                         img = None
                     if img is not None:
                         name = OUTPUT_FORMATS.get(cap.last_fmt, (PACKED_OUTPUT_FORMATS.get(cap.last_fmt, f"fmt {cap.last_fmt}"),))[0]
-                        for n, t in enumerate([f"SAIDA DLSS slot {i}  frame {oinfo['frame_seq']}  "
-                                               f"{img.shape[1]}x{img.shape[0]}  {name}"]):
+                        img = np.ascontiguousarray(img)
+                        for n, t in enumerate([title, f"{img.shape[1]}x{img.shape[0]}  {name}"]):
                             cv2.putText(img, t, (8, 20 + 18 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
                                         cv2.LINE_AA)
-                        last[i] = (oinfo["frame_seq"], img, ("saida", mode))
+                        last[i] = (identity, img, ("saida", mode))
                         frames += 1
                     else:
                         last.pop(i, None)
@@ -584,7 +623,8 @@ def main():
             last.clear()
             print("modo:", mode)
         elif k == ord("c"):
-            mode = "mv" if mode == "output" else "output"
+            # mv -> saida logo apos o DLSS -> saida tardia -> diferenca -> mv
+            mode = {"mv": "output", "depth": "output", "output": "late", "late": "diff"}.get(mode, "mv")
             last.clear()
             print("modo:", mode)
         elif k == ord("i"):

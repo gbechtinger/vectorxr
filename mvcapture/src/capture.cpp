@@ -97,6 +97,16 @@ struct Slot {
     D3D11_TEXTURE2D_DESC out_desc{};
     D3D11_TEXTURE2D_DESC out_failed{};
     std::uint32_t out_generation{0};
+    // The late copy (see OutputSlot::post_handle): the game's output texture of the previous evaluation, kept alive here
+    // until this slot's next evaluation begins, and the shared textures it is copied to.
+    ComPtr<ID3D11Texture2D> prev_output;
+    std::uint32_t prev_ring{0};
+    std::uint64_t prev_frame_seq{0};
+    ComPtr<ID3D11Texture2D> post[kRing];
+    HANDLE post_handle[kRing]{};
+    D3D11_TEXTURE2D_DESC post_desc{};
+    D3D11_TEXTURE2D_DESC post_failed{};
+    std::uint32_t post_generation{0};
 
     std::uint32_t ring{kRing - 1};
     std::uint64_t frame_seq{0};
@@ -153,6 +163,9 @@ void CloseSlot(Slot& slot) {
         }
         if (slot.out_handle[i]) {
             CloseHandle(slot.out_handle[i]);
+        }
+        if (slot.post_handle[i]) {
+            CloseHandle(slot.post_handle[i]);
         }
     }
     slot = Slot{};
@@ -229,7 +242,9 @@ void UnpublishOutput(State& s, std::uint32_t index) {
     info.valid = 0;
     for (std::uint32_t i = 0; i < kRing; ++i) {
         info.handle[i] = 0;
+        info.post_handle[i] = 0;
     }
+    info.post_valid = 0;
     MemoryBarrier();
     InterlockedIncrement64(&info.sequence); // even: published
 }
@@ -603,43 +618,52 @@ bool CaptureMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint
     return true;
 }
 
-// Copies what DLSS wrote into slot.out[ring]. False when it cannot be captured (logged once per description).
-bool CaptureOutput(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t ring, ID3D11Resource* output) {
+// Copies `source` into textures[ring], (re)creating the shared ring when its description changed. False when it cannot
+// be captured (logged once per description).
+bool CopyShared(State& s, ID3D11DeviceContext* context, ComPtr<ID3D11Texture2D>* textures, HANDLE* handles,
+                D3D11_TEXTURE2D_DESC& current, D3D11_TEXTURE2D_DESC& failed, std::uint32_t& generation,
+                std::uint32_t ring, ID3D11Resource* resource, const char* what) {
     ComPtr<ID3D11Texture2D> source;
-    if (FAILED(output->QueryInterface(IID_PPV_ARGS(&source)))) {
+    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&source)))) {
         return false;
     }
     D3D11_TEXTURE2D_DESC desc{};
     source->GetDesc(&desc);
-    if (desc.SampleDesc.Count > 1 || SameDesc(desc, slot.out_failed)) {
+    if (desc.SampleDesc.Count > 1 || SameDesc(desc, failed)) {
         return false;
     }
-    if (!SameDesc(desc, slot.out_desc) || !slot.out[0]) {
-        slot.out_generation = ++s.generation_counter; // new handles: readers must not reuse cached ones
+    if (!SameDesc(desc, current) || !textures[0]) {
+        generation = ++s.generation_counter; // new handles: readers must not reuse cached ones
         for (std::uint32_t i = 0; i < kRing; ++i) {
-            if (slot.out_handle[i]) {
-                CloseHandle(slot.out_handle[i]);
-                slot.out_handle[i] = nullptr;
+            if (handles[i]) {
+                CloseHandle(handles[i]);
+                handles[i] = nullptr;
             }
-            slot.out[i].Reset();
+            textures[i].Reset();
         }
-        if (!MakeShared(s.device.Get(), desc, D3D11_BIND_SHADER_RESOURCE, slot.out, slot.out_handle)) {
-            Log("output: could not create shared textures (format %u %ux%u)", desc.Format, desc.Width, desc.Height);
+        if (!MakeShared(s.device.Get(), desc, D3D11_BIND_SHADER_RESOURCE, textures, handles)) {
+            Log("%s: could not create shared textures (format %u %ux%u)", what, desc.Format, desc.Width, desc.Height);
             for (std::uint32_t i = 0; i < kRing; ++i) {
-                if (slot.out_handle[i]) {
-                    CloseHandle(slot.out_handle[i]);
-                    slot.out_handle[i] = nullptr;
+                if (handles[i]) {
+                    CloseHandle(handles[i]);
+                    handles[i] = nullptr;
                 }
-                slot.out[i].Reset();
+                textures[i].Reset();
             }
-            slot.out_failed = desc;
+            failed = desc;
             return false;
         }
-        slot.out_desc = desc;
-        Log("output: shared DLSS output %ux%u format %u array %u", desc.Width, desc.Height, desc.Format, desc.ArraySize);
+        current = desc;
+        Log("%s: shared %ux%u format %u array %u", what, desc.Width, desc.Height, desc.Format, desc.ArraySize);
     }
-    context->CopyResource(slot.out[ring].Get(), source.Get());
+    context->CopyResource(textures[ring].Get(), source.Get());
     return true;
+}
+
+// Copies what DLSS wrote into slot.out[ring].
+bool CaptureOutput(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t ring, ID3D11Resource* output) {
+    return CopyShared(s, context, slot.out, slot.out_handle, slot.out_desc, slot.out_failed, slot.out_generation, ring,
+                      output, "output");
 }
 
 std::uint32_t BytesPerPixel(DXGI_FORMAT format) {
@@ -772,6 +796,42 @@ bool Enabled() {
     return !(length > 0 && length < 8 && value[0] == L'0');
 }
 
+// The texture DLSS wrote for this slot's previous evaluation, copied again now, before this evaluation overwrites it:
+// it holds whatever the game drew over it for that frame (if it draws on that texture), and published in the output
+// mapping next to the copy made when the evaluation returned.
+void PublishLateOutput(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t index) {
+    ID3D11Texture2D* previous = slot.prev_output.Get();
+    const std::uint32_t ring = slot.prev_ring;
+    if (!EnsureOutputBlock(s) ||
+        !CopyShared(s, context, slot.post, slot.post_handle, slot.post_desc, slot.post_failed, slot.post_generation, ring,
+                    previous, "output (late)")) {
+        slot.prev_output.Reset();
+        return;
+    }
+    std::uint64_t fence_value = 0;
+    if (s.fence) {
+        ComPtr<ID3D11DeviceContext4> context4;
+        if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4)))) {
+            fence_value = ++s.fence_value;
+            context4->Signal(s.fence.Get(), fence_value);
+        }
+    }
+    OutputSlot& info = s.output_block->slots[index];
+    InterlockedIncrement64(&info.sequence); // odd: being written
+    MemoryBarrier();
+    for (std::uint32_t i = 0; i < kRing; ++i) {
+        info.post_handle[i] = reinterpret_cast<std::uint64_t>(slot.post_handle[i]);
+    }
+    info.post_frame_seq = slot.prev_frame_seq;
+    info.post_fence_value = fence_value;
+    info.post_ring = ring;
+    info.post_generation = slot.post_generation;
+    info.post_valid = 1;
+    MemoryBarrier();
+    InterlockedIncrement64(&info.sequence); // even: published
+    slot.prev_output.Reset();
+}
+
 void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters) {
     if (!context || !parameters) {
         return;
@@ -847,6 +907,9 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, c
     }
     slot->last_use = s.calls;
     const std::uint32_t ring = (slot->ring + 1) % kRing;
+    if (slot->prev_output) {
+        PublishLateOutput(s, context, *slot, index);
+    }
 
     const bool have_mv = CaptureMotion(s, context, *slot, ring, in.mv);
     const bool have_depth = in.depth && CaptureDepth(s, context, *slot, ring, in.depth);
@@ -924,6 +987,12 @@ void OnEvaluateDone(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* featur
     const std::uint32_t ring = slot.ring;
     if (!CaptureOutput(s, context, slot, ring, output)) {
         return;
+    }
+    // Kept until this slot's next evaluation begins, to be copied again then (PublishLateOutput).
+    slot.prev_output.Reset();
+    if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&slot.prev_output)))) {
+        slot.prev_ring = ring;
+        slot.prev_frame_seq = slot.frame_seq;
     }
 
     std::uint64_t fence_value = 0;
