@@ -282,8 +282,8 @@ class Capture:
                 f = struct.unpack(OUT_SLOT_FMT, raw)
                 return {"valid": f[1], "ring": f[2], "frame_seq": f[3], "fence": f[4], "output_handle": f[5:8],
                         "width": f[8], "height": f[9], "format": f[10], "array": f[11], "generation": f[12],
-                        "post_handle": f[13:16], "post_seq": f[16], "post_fence": f[17], "post_ring": f[18],
-                        "post_valid": f[19], "post_generation": f[20]}
+                        "post_handle": f[14:17], "post_seq": f[17], "post_fence": f[18], "post_ring": f[19],
+                        "post_valid": f[20], "post_generation": f[21]}
         return None
 
     def header(self):
