@@ -136,6 +136,8 @@ struct ViewResources {
     // The game's motion vectors (FrameGenViewRequest::game_motion), copied
     // from the capture DLL's shared texture for this frame.
     Texture game_motion;
+    // DLSS's output for the newest frame (FrameGenViewRequest::game_output), copied the same way (research).
+    Texture game_output;
     Texture shift_keys;
     Texture shift_map; // rebuilt for each generated frame
     Texture depth_stale; // kDepthStale's, for a frame moved by the previous frame's motion
@@ -4335,6 +4337,13 @@ class D3D12FrameGen final : public FrameGenGpu {
     // queue after the capture DLL's copy finished.
     bool CopyGameMotion(ViewResources& view, const FrameGenGameMotion& motion,
                         std::vector<D3D12_RESOURCE_BARRIER>& barriers, std::string& error) {
+        return CopyGameTexture(view, view.game_motion, motion, barriers, error);
+    }
+
+    // The same copy into `target` (the view's game_motion or game_output).
+    bool CopyGameTexture(ViewResources& view, Texture& target, const FrameGenGameMotion& motion,
+                         std::vector<D3D12_RESOURCE_BARRIER>& barriers, std::string& error) {
+        (void)view;
         ID3D12Resource* shared = nullptr;
         ID3D12Fence* fence = nullptr;
         if (!OpenGameMotion(motion, &shared, &fence)) {
@@ -4345,22 +4354,21 @@ class D3D12FrameGen final : public FrameGenGpu {
         if (!GameFormat(desc.Format, view_format)) {
             return false;
         }
-        if (!view.game_motion.resource || view.game_motion.resource->GetDesc().Width != desc.Width ||
-            view.game_motion.resource->GetDesc().Height != desc.Height ||
-            view.game_motion.view_format != view_format) {
-            if (view.game_motion.resource && !WaitIdle()) {
+        if (!target.resource || target.resource->GetDesc().Width != desc.Width ||
+            target.resource->GetDesc().Height != desc.Height || target.view_format != view_format) {
+            if (target.resource && !WaitIdle()) {
                 return false;
             }
-            if (!Create(view.game_motion, {static_cast<std::uint32_t>(desc.Width), desc.Height}, view_format, view_format,
+            if (!Create(target, {static_cast<std::uint32_t>(desc.Width), desc.Height}, view_format, view_format,
                         false, error, true)) {
                 return false;
             }
         }
         work_->Wait(fence, motion.fence_value);
-        Require(barriers, view.game_motion, D3D12_RESOURCE_STATE_COPY_DEST);
+        Require(barriers, target, D3D12_RESOURCE_STATE_COPY_DEST);
         Transition(barriers, shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Flush(barriers);
-        commands_->CopyResource(view.game_motion.resource.Get(), shared);
+        commands_->CopyResource(target.resource.Get(), shared);
         Transition(barriers, shared, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Flush(barriers);
         return true;
@@ -4400,6 +4408,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         case FrameGenTextureKind::kDepthScaleVotes: return &view.depth_scale_votes;
         case FrameGenTextureKind::kDepthScaleRaw: return &view.depth_scale_raw;
         case FrameGenTextureKind::kGameMotion: return &view.game_motion;
+        case FrameGenTextureKind::kGameOutput: return &view.game_output;
         default: return nullptr;
         }
     }
@@ -4485,6 +4494,11 @@ class D3D12FrameGen final : public FrameGenGpu {
             effective.game_motion.valid = CopyGameMotion(view, effective.game_motion, barriers, error);
         } else {
             effective.game_motion.valid = false;
+        }
+        if (effective.game_output.valid && tuning.overlay_view != 0) {
+            effective.game_output.valid = CopyGameTexture(view, view.game_output, effective.game_output, barriers, error);
+        } else {
+            effective.game_output.valid = false;
         }
         // The hardware matched this frame against the previous one as soon
         // as the game released it: usable when that previous one is the frame

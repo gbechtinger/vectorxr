@@ -627,6 +627,7 @@ class FrameGenPresenter {
         std::uint64_t frame_seq{0}; // the capture DLL's count of this slot's DLSS evaluations
         FrameGenGameMotion motion;
         bool depth{false}; // the capture DLL's depth was linearized into the view's depth for this capture
+        FrameGenGameMotion output; // DLSS's output for the same evaluation (VECTORXR_FRAMEGEN_OVERLAY_VIEW)
     };
 
     // An output image per output index: its extent and what it holds.
@@ -1494,6 +1495,12 @@ class FrameGenPresenter {
     std::array<QuadCapture, 4> quad_captures_{};
     bool game_motion_enabled_{false};
     bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
+    // Research: VECTORXR_FRAMEGEN_OVERLAY_VIEW=1 tints in cyan what the game drew after DLSS (the newest frame differs
+    // from DLSS's output there), 2 shows the difference as a gradient; _THRESHOLD is of 255 (default 40).
+    std::uint8_t overlay_view_{0};
+    std::uint8_t overlay_threshold_{40};
+    bool logged_game_output_{false};
+    bool logged_game_output_mismatch_{false};
     std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
     std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
     std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)

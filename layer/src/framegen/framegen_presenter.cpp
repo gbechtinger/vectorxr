@@ -413,6 +413,12 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         // Without the capture DLL nothing is ever generated.
         const char* only = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_ONLY");
         game_motion_only_ = only && std::string(only) == "1";
+        // Research: tint what the game drew after DLSS (needs the capture DLL's VECTORXR_MVCAPTURE_OUTPUT=1).
+        const char* overlay = std::getenv("VECTORXR_FRAMEGEN_OVERLAY_VIEW");
+        overlay_view_ = overlay && std::string(overlay) == "1" ? 1 : overlay && std::string(overlay) == "2" ? 2 : 0;
+        if (const char* threshold = std::getenv("VECTORXR_FRAMEGEN_OVERLAY_THRESHOLD")) {
+            overlay_threshold_ = static_cast<std::uint8_t>(std::clamp(std::atoi(threshold), 1, 255));
+        }
         // Experiments: FORCE keeps the best game vector even where no motion
         // matches the images better; FLIP reverses the vectors' direction.
         const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
@@ -1261,6 +1267,67 @@ bool GameMotionFlowing() {
     return flowing;
 }
 
+// The DLSS output mapping (VECTORXR_MVCAPTURE_OUTPUT=1 in the game), opened like the main block, once a second at most.
+mvcapture::OutputReader& GameOutputReader() {
+    static mvcapture::OutputReader reader;
+    return reader;
+}
+
+// DLSS's output for the evaluation `motion_seq` of `view`'s slot (the one ReadGameMotion just read). The output slot
+// publishes after the main one, so it may already be one evaluation ahead: the previous ring entry is then the one
+// (its fence value is the newer evaluation's, which only waits longer). False when it is not captured or not that
+// evaluation.
+bool ReadGameOutput(std::size_t view, std::uint64_t motion_seq, FrameGenGameMotion& out, bool& mismatch) {
+    mismatch = false;
+    static Clock::time_point next_try{};
+    mvcapture::OutputReader& reader = GameOutputReader();
+    if (!reader.Get()) {
+        const auto now = Clock::now();
+        if (now < next_try) {
+            return false;
+        }
+        if (!reader.Open()) {
+            next_try = now + std::chrono::seconds(1);
+            return false;
+        }
+    }
+    const mvcapture::Reader& main_reader = GameMotionReader();
+    static const bool swap = [] {
+        const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_SWAP");
+        return value && std::string(value) == "1";
+    }();
+    std::uint32_t slot = static_cast<std::uint32_t>(view);
+    if (swap && slot < 2) {
+        slot = 1 - slot;
+    }
+    mvcapture::OutputSlot info{};
+    if (!main_reader.Get() || !reader.ReadSlot(slot, info)) {
+        return false;
+    }
+    std::uint32_t ring = info.ring_index;
+    if (info.frame_seq == motion_seq + 1) {
+        ring = (ring + mvcapture::kRing - 1) % mvcapture::kRing;
+    } else if (info.frame_seq != motion_seq) {
+        mismatch = true;
+        return false;
+    }
+    const std::uint64_t texture = ring < mvcapture::kRing ? info.handle[ring] : 0;
+    const std::uint64_t fence = main_reader.Get()->fence_handle;
+    if (!texture || !fence || info.array_size != 1 || info.width == 0 || info.height == 0) {
+        return false;
+    }
+    out = {};
+    out.valid = true;
+    out.texture = texture;
+    out.fence = fence;
+    out.fence_value = info.fence_value;
+    out.generation = info.generation;
+    out.width = info.width;
+    out.height = info.height;
+    out.format = info.format;
+    return true;
+}
+
 // The capture DLL's newest motion vectors for `view` (its slot: slots are in
 // the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
 // variable exchanges the first two). False when the DLL is not loaded, the
@@ -1469,6 +1536,22 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
             snapshot.frame_seq = seq;
             snapshot.motion = fresh ? motion : FrameGenGameMotion{};
             snapshot.depth = false;
+            snapshot.output = FrameGenGameMotion{};
+            if (fresh && overlay_view_ != 0) {
+                bool mismatch = false;
+                if (ReadGameOutput(job.view, seq, snapshot.output, mismatch)) {
+                    if (logger_ && !logged_game_output_) {
+                        logged_game_output_ = true;
+                        logger_->Info("Frame Generation found DLSS's output: " + std::to_string(snapshot.output.width) + "x" +
+                                      std::to_string(snapshot.output.height) + " format " + std::to_string(snapshot.output.format) +
+                                      " (VECTORXR_FRAMEGEN_OVERLAY_VIEW).");
+                    }
+                } else if (mismatch && logger_ && !logged_game_output_mismatch_) {
+                    logged_game_output_mismatch_ = true;
+                    logger_->Info("Frame Generation: DLSS's output is not the evaluation of the game's vectors (a frame apart or more); "
+                                  "the overlay view skips those frames.");
+                }
+            }
             if (fresh && depth.valid && GameDepthEncoding() && gpu_->SupportsGameDepth() &&
                 !std::any_of(jobs.begin(), jobs.end(),
                              [&](const Job& other) { return other.depth && other.view == job.view; })) {
@@ -3709,6 +3792,8 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
         tuning.diagnostic = settings_.diagnostic_view;
         tuning.artifact_suppression = settings_.artifact_suppression;
         tuning.motion_limit_percent = settings_.motion_limit_percent;
+        tuning.overlay_view = overlay_view_;
+        tuning.overlay_threshold = overlay_threshold_;
         tuning.generated = static_cast<std::uint8_t>(count);
         for (std::size_t index = 0; index < count; ++index) {
             tuning.fractions[index] = fractions[index];
@@ -3805,6 +3890,7 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     snapshot.releases == record->second.captured_releases) {
                     submission.request.game_motion = snapshot.motion;
                     submission.request.game_motion.flags = game_motion_flags_;
+                    submission.request.game_output = overlay_view_ != 0 ? snapshot.output : FrameGenGameMotion{};
                     ++game_motion_sent_;
                 } else if (g_game_motion_dll_seen) {
                     ++game_motion_missing_;

@@ -108,3 +108,13 @@ It lives in its own mapping, `Local\VectorXR.MvCapture.Output.<pid>` (`OutputBlo
 `OutputReader`), so the main block and everything that reads it stay as they are. Slots are the main block's slots, and
 the textures are ordered by the same shared fence. It costs a copy of the full output image per evaluation and video
 memory for three of them per eye, which is why it is opt-in. Nothing in the layer reads it yet.
+
+## Seeing what the game drew after DLSS (research)
+
+With `VECTORXR_MVCAPTURE_OUTPUT=1` in the game and `VECTORXR_FRAMEGEN_OVERLAY_VIEW=1` in the VR app's environment,
+generated frames are tinted cyan where the newest frame differs from DLSS's output, which is where the game drew its
+HUD, displays, helmet display and menus after DLSS. `2` shows the difference as a gradient instead of a mask, and
+`VECTORXR_FRAMEGEN_OVERLAY_THRESHOLD` (of 255, default 40, in square-root values) sets where the mask starts.
+DLSS's output is linear and the final frame has the game's tone mapping, so this marks more than the overlay wherever
+that curve is not the identity; it is a view to see how far a plain comparison gets, and changes nothing else.
+Direct3D 12 only, interpolation and extrapolation alike; the log says when the output was found.

@@ -292,6 +292,23 @@ FrameGenConstants BuildFrameGenComposeConstants(const FrameGenComposeEye& eye, F
     return constants;
 }
 
+// Research (FrameGenTuning::overlay_view): the synthesis passes also get DLSS's output, to tint what the game drew
+// over it.
+static void AttachGameOutput(FrameGenViewPlan& plan, const FrameGenViewRequest& request, const FrameGenTuning& tuning) {
+    if (tuning.overlay_view == 0 || !request.game_output.valid) {
+        return;
+    }
+    for (FrameGenDispatch& dispatch : plan.dispatches) {
+        if ((dispatch.pass != FrameGenPass::kSynthesizeUnorm8 && dispatch.pass != FrameGenPass::kSynthesizeFloat16) ||
+            (dispatch.constants.options[1] & kFrameGenFlagStill) != 0u) {
+            continue;
+        }
+        dispatch.inputs[5] = Texture(FrameGenTextureKind::kGameOutput);
+        dispatch.constants.options[1] |= kFrameGenFlagOverlay | (tuning.overlay_view == 2 ? kFrameGenFlagOverlayHeat : 0u) |
+                                         (static_cast<std::uint32_t>(tuning.overlay_threshold) << 16);
+    }
+}
+
 FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const FrameGenTuning& tuning) {
     FrameGenViewPlan plan;
     plan.extent = request.extent;
@@ -538,6 +555,7 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         output.copy_mask = static_cast<std::uint8_t>(1u << index);
         plan.dispatches.push_back(output);
     }
+    AttachGameOutput(plan, request, tuning);
     return plan;
 }
 
@@ -602,6 +620,7 @@ FrameGenViewPlan BuildFrameGenSynthesisPlan(const FrameGenViewRequest& request, 
         output.outputs = {Texture(FrameGenTextureKind::kOutput), {}};
         output.copy_mask = 1u;
         plan.dispatches.push_back(output);
+        AttachGameOutput(plan, request, tuning);
         return plan;
     }
     const FrameGenTexture depth = request.depth ? Texture(FrameGenTextureKind::kDepth) : FrameGenTexture{};
@@ -630,6 +649,7 @@ FrameGenViewPlan BuildFrameGenSynthesisPlan(const FrameGenViewRequest& request, 
     output.outputs = {Texture(FrameGenTextureKind::kOutput), {}};
     output.copy_mask = 1u;
     plan.dispatches.push_back(output);
+    AttachGameOutput(plan, request, tuning);
     return plan;
 }
 
@@ -884,6 +904,7 @@ FrameGenViewRequest FrameGenHistoryState::Effective(const FrameGenViewRequest& r
     effective.temporal = effective.synthesize && request.temporal && filtered_valid_[Previous()];
     effective.trust_history = effective.synthesize && trust_valid_[Previous()];
     effective.game_motion.valid = effective.game_motion.valid && effective.synthesize;
+    effective.game_output.valid = effective.game_output.valid && effective.synthesize;
     return effective;
 }
 
