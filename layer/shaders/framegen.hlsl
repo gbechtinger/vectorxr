@@ -1318,7 +1318,7 @@ float4 Synthesize(float2 position, float fraction) {
         const float difference = MaxComponent(abs(Perceptual(dlss) - Perceptual(frame)));
         const float threshold = max(float((g.options.y >> 16) & 0xffu) / 255.0, 1.0 / 255.0);
         const float amount = (g.options.y & FG_FLAG_OVERLAY_HEAT) != 0u ? saturate(0.5 * difference / threshold)
-                                                                       : step(threshold, difference);
+                                                                       : (difference >= threshold ? 1.0 : 0.0);
         result.rgb = lerp(result.rgb, float3(0.0, 1.0, 1.0), 0.7 * amount);
     }
 #endif
