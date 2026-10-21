@@ -410,8 +410,8 @@ def _read_output(self, ent, raw=False):
         raise RuntimeError(f"Map falhou: 0x{hr & 0xFFFFFFFF:08x}")
     try:
         w, h = ent["w"], ent["h"]
-        raw = (ctypes.c_ubyte * (m.RowPitch * h)).from_address(m.pData)
-        data = np.frombuffer(raw, dtype=np.uint8).reshape(h, m.RowPitch)
+        buffer = (ctypes.c_ubyte * (m.RowPitch * h)).from_address(m.pData)
+        data = np.frombuffer(buffer, dtype=np.uint8).reshape(h, m.RowPitch)
         if packed:
             v = np.ascontiguousarray(data[:, :w * 4]).view(np.uint32).reshape(h, w)
             if fmt_id == 26:
