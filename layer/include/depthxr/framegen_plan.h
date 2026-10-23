@@ -193,6 +193,27 @@ inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 2048u;
 // as a gradient instead of a mask.
 inline constexpr std::uint32_t kFrameGenFlagOverlay = 4096u;
 inline constexpr std::uint32_t kFrameGenFlagOverlayHeat = 8192u;
+// Flow passes drop vectors on flat blocks and vectors that do not beat no
+// motion (FrameGenTuning::flow_guard).
+inline constexpr std::uint32_t kFrameGenFlagFlowGuard = 16384u;
+
+// ===== Flow guard: the two values to edit ===================================
+// Used by the flow passes (FG_PASS_REFINE, FG_PASS_FLOW_UNPACK) through
+// FlowKeep in framegen.hlsl; the layer must be rebuilt after a change.
+//
+// kFrameGenFlowMargin: how much better than "no motion" a measured vector must
+// match (mean luma difference, square-root domain) to be kept.
+//   Higher: fewer vectors kept, less ghosting on plain background, but slow
+//   scenery motion is scaled unevenly between blocks (shimmer like heat haze),
+//   and flat moving objects may stall.
+//   Lower: the opposite. Range that makes sense: 0.001 to 0.05.
+inline constexpr float kFrameGenFlowMargin = 0.001f;
+// kFrameGenFlatRange: the luma spread (square-root domain) below which a block
+// is flat (dithering, banding or a vignette over a plain background) and its
+// vector fades out. Applies to the shader flow only. Range: 0.005 to 0.1.
+inline constexpr float kFrameGenFlatRange = 0.01f;
+// =============================================================================
+
 // World motion: samples per side of the fit's grid, and its iterations.
 inline constexpr std::uint32_t kFrameGenWorldGrid = 128u;
 // The trust vote's tile side in half-resolution texels (FG_TRUST_TILE):
@@ -444,6 +465,14 @@ struct FrameGenTuning {
     // after DLSS), 2 shows the difference as a gradient; the threshold is of 255, in perceptual (square root) values.
     std::uint8_t overlay_view{0};
     std::uint8_t overlay_threshold{40};
+    // Flow passes keep zero motion on flat blocks and where a vector does not
+    // clearly beat no motion (ghosting of content copied into plain
+    // background). Always on.
+    bool flow_guard{true};
+    // The flow guard's thresholds (FlowKeep), set by kFrameGenFlowMargin and
+    // kFrameGenFlatRange above.
+    float flow_margin{kFrameGenFlowMargin};
+    float flat_range{kFrameGenFlatRange};
     // Quad views: how each eye is composed from its views, for the flow
     // merge and the focus views' motion limit; null on the canvas path. Not
     // owned: the caller keeps it alive for the Execute call.

@@ -78,6 +78,10 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 // threshold of 255 is in bits 16-23, and the heat flag shows the difference as a gradient.
 #define FG_FLAG_OVERLAY 4096u
 #define FG_FLAG_OVERLAY_HEAT 8192u
+// Flow passes (FG_PASS_SEARCH, REFINE, FLOW_UNPACK): vectors on flat blocks,
+// and vectors that do not beat no motion, are dropped (see FlowKeep). Always
+// set by the plan (FrameGenTuning::flow_guard).
+#define FG_FLAG_FLOW_GUARD 16384u
 
 // Linear depth at or beyond this many meters is treated as infinitely far.
 #define FG_FAR_DEPTH 100000.0
@@ -120,7 +124,32 @@ static const float kDepthScaleProbes[FG_SCALE_PROBES] = {0.7, 0.8, 0.9, 1.0, 1.1
 #define FG_PATCH_RADIUS 2
 #define FG_INVALID_PENALTY 0.25
 #define FG_MOTION_PENALTY 0.05
+// Flow guard. A block whose luma (square-root domain) varies by less than the
+// flat range has no texture to measure motion with: dithering, banding or a
+// vignette over a plain background make every vector cost about the same, and
+// a neighbour's vector (a moving menu's) won on differences far below what the
+// eye sees, copying that content into the background. And a measured vector
+// must match better than no motion by at least the margin to be kept: on plain
+// or noisy background every vector, a hardware one above all (its 4x4 grid of
+// vectors is arbitrary where nothing can be matched), costs about what no
+// motion costs, and each cell copied content from wherever its vector pointed,
+// the cells' edges cracking the copy like dry mud.
+// The values are kFrameGenFlatRange and kFrameGenFlowMargin in
+// framegen_plan.h (tuning.z and tuning.w of the passes that use FlowKeep).
 
+// How much of a measured vector to keep (FG_FLAG_FLOW_GUARD): 0 where it does
+// not beat no motion by a quarter margin (`gain`: the cost saved) or its block
+// is flat (`range`: its luma spread), 1 from two margins (and twice the flat
+// range) up, a smooth ramp between: a hard threshold flipped blocks between a
+// vector and none from one frame to the next and shimmered the scenery.
+// The thresholds come in tuning.w (margin) and tuning.z (flat range) of the
+// passes that use it (REFINE, FLOW_UNPACK): kFrameGenFlowMargin and
+// kFrameGenFlatRange in framegen_plan.h.
+float FlowKeep(float gain, float range) {
+    const float margin = max(g.tuning.w, 0.001);
+    const float flat = max(g.tuning.z, 0.001);
+    return smoothstep(0.25 * margin, 2.0 * margin, gain) * smoothstep(0.5 * flat, 1.5 * flat, range);
+}
 float Luma(float3 rgb) {
     // Square-root luma keeps shadow detail matchable; linear values crowd
     // dark scenery into a few codes and make the flow ghost there.
@@ -518,8 +547,27 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     const float2 sub = float2(
         SubTexel(BlockCost(block, best - int2(1, 0)), best_cost, BlockCost(block, best + int2(1, 0))),
         SubTexel(BlockCost(block, best - int2(0, 1)), best_cost, BlockCost(block, best + int2(0, 1))));
+    // The final level's vectors fade toward no motion as they stop beating it
+    // (the flow margin) and as their block loses texture (the flat range):
+    // a hard cut flickered between a vector and none from frame to frame.
+    float2 found = float2(best) + sub;
+    if ((g.options.y & FG_FLAG_FLOW_GUARD) != 0u && any(best != 0)) {
+        float block_low = 1e30;
+        float block_high = -1e30;
+        [unroll]
+        for (int b = 0; b < FG_BLOCK * FG_BLOCK; ++b) {
+            if (block.valid[b]) {
+                block_low = min(block_low, block.luma[b]);
+                block_high = max(block_high, block.luma[b]);
+            }
+        }
+        const float still_cost = BlockCost(block, int2(0, 0));
+        const float keep = FlowKeep(still_cost - best_cost, block_high - block_low);
+        found *= keep;
+        best_cost = lerp(still_cost, best_cost, keep);
+    }
     // w: the cost of no motion (FG_PASS_FILTER's rigid test).
-    g_flow[id.xy] = float4((float2(best) + sub) / match, best_cost, ZeroCost(block));
+    g_flow[id.xy] = float4(found / match, best_cost, ZeroCost(block));
 }
 #endif
 
@@ -1883,8 +1931,14 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
-    const float cost = sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
+    float cost = sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
     const float zero = zero_count >= 0.5 * max(count, 1.0) ? zero_sum / zero_count : -1.0;
+    // Vectors fade toward no motion as they stop beating it (the flow margin).
+    if ((g.options.y & FG_FLAG_FLOW_GUARD) != 0u && zero >= 0.0 && any(offset != 0)) {
+        const float keep = FlowKeep(zero - cost, 1.0);
+        d *= keep;
+        cost = lerp(zero, cost, keep);
+    }
     g_flow[id.xy] = float4(d / float2(extent), cost, zero);
 }
 #endif

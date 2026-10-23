@@ -117,6 +117,9 @@ FrameGenConstants BaseConstants(const FrameGenViewRequest& request, const FrameG
     if (tuning.confidence_factors) {
         flags |= kFrameGenFlagConfidenceFactors;
     }
+    if (tuning.flow_guard) {
+        flags |= kFrameGenFlagFlowGuard;
+    }
     base.options = {kFrameGenSearchRadius, flags, static_cast<std::uint32_t>(tuning.diagnostic), 0};
     base.tuning = {std::clamp(tuning.fractions[0], 0.0f, 1.0f), limit, 4.0f + 26.0f * suppression,
                    3.0f + 21.0f * suppression};
@@ -415,6 +418,8 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
                          {}};
         unpack.outputs = {Texture(FrameGenTextureKind::kFlow, kFrameGenHardwareFlowLevel), {}};
         unpack.constants.options[0] = request.hardware_raw ? 1u : 0u;
+        unpack.constants.tuning[2] = tuning.flat_range;
+        unpack.constants.tuning[3] = tuning.flow_margin;
         unpack.constants.options[3] = 1u << (kFrameGenHardwareFlowLevel - 1);
         plan.dispatches.push_back(unpack);
     }
@@ -460,6 +465,7 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
                          Texture(FrameGenTextureKind::kLumaPrevious, kFrameGenPyramidLevels), {}, {}, {}};
         search.outputs = {Texture(FrameGenTextureKind::kFlow, kFrameGenPyramidLevels), {}};
         search.constants.options[3] = 1;
+        search.constants.options[1] &= ~kFrameGenFlagFlowGuard;
         plan.dispatches.push_back(search);
     }
 
@@ -475,6 +481,13 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         refine.outputs = {Texture(FrameGenTextureKind::kFlow, level), {}};
         refine.constants.options[3] = 1u << (level - match);
         refine.constants.tuning[0] = std::clamp(tuning.interval_ratio, 0.25f, 4.0f);
+        refine.constants.tuning[2] = tuning.flat_range; // the flow guard's thresholds (FlowKeep)
+        refine.constants.tuning[3] = tuning.flow_margin;
+        // Only the final level's vectors are judged; coarser levels pass raw
+        // vectors down so finer cells can still find their own.
+        if (level != plan.final_flow_level) {
+            refine.constants.options[1] &= ~kFrameGenFlagFlowGuard;
+        }
         plan.dispatches.push_back(refine);
         if (level == plan.final_flow_level) {
             break;
