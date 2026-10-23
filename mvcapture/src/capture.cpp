@@ -82,31 +82,8 @@ struct Slot {
     const void* depth_src_key{nullptr};
     ComPtr<ID3D11ShaderResourceView> depth_src_view;
 
-    // CPU preview (VECTORXR_MVCAPTURE_PREVIEW): two staging copies read in turn.
-    ComPtr<ID3D11Texture2D> preview_stage[2];
-    bool preview_pending[2]{};
-    std::uint32_t preview_next{0};
-    std::uint64_t preview_tick{0};
-    D3D11_TEXTURE2D_DESC preview_desc{};
     // The DLSS feature last seen on this slot (only compared, never dereferenced), to log recreations.
     const void* feature{nullptr};
-
-    // The DLSS output (VECTORXR_MVCAPTURE_OUTPUT=1): what DLSS wrote, before the game draws anything over it.
-    ComPtr<ID3D11Texture2D> out[kRing];
-    HANDLE out_handle[kRing]{};
-    D3D11_TEXTURE2D_DESC out_desc{};
-    D3D11_TEXTURE2D_DESC out_failed{};
-    std::uint32_t out_generation{0};
-    // The late copy (see OutputSlot::post_handle): the game's output texture of the previous evaluation, kept alive here
-    // until this slot's next evaluation begins, and the shared textures it is copied to.
-    ComPtr<ID3D11Texture2D> prev_output;
-    std::uint32_t prev_ring{0};
-    std::uint64_t prev_frame_seq{0};
-    ComPtr<ID3D11Texture2D> post[kRing];
-    HANDLE post_handle[kRing]{};
-    D3D11_TEXTURE2D_DESC post_desc{};
-    D3D11_TEXTURE2D_DESC post_failed{};
-    std::uint32_t post_generation{0};
 
     std::uint32_t ring{kRing - 1};
     std::uint64_t frame_seq{0};
@@ -131,17 +108,7 @@ struct State {
 
     HANDLE mapping{};
     Block* block{};
-    bool preview{false};
-    bool preview_checked{false};
-    HANDLE preview_mapping{};
-    std::uint8_t* preview_view{};
     Slot slots[kMaxSlots];
-
-    // The DLSS output mapping (VECTORXR_MVCAPTURE_OUTPUT=1), and the slot whose vectors OnEvaluate just published
-    // (OnEvaluateDone copies that evaluation's output), -1 when there is none.
-    HANDLE output_mapping{};
-    OutputBlock* output_block{};
-    int pending_slot{-1};
 
     // Features evaluated since the start of the current round (one round = one frame: every eye once).
     const void* round_features[kMaxSlots]{};
@@ -160,12 +127,6 @@ void CloseSlot(Slot& slot) {
         }
         if (slot.depth_handle[i]) {
             CloseHandle(slot.depth_handle[i]);
-        }
-        if (slot.out_handle[i]) {
-            CloseHandle(slot.out_handle[i]);
-        }
-        if (slot.post_handle[i]) {
-            CloseHandle(slot.post_handle[i]);
         }
     }
     slot = Slot{};
@@ -194,61 +155,6 @@ bool EnsureBlock(State& s) {
     return true;
 }
 
-// VECTORXR_MVCAPTURE_OUTPUT=1: also capture what DLSS writes (see shared.h, OutputBlock). Read once.
-bool OutputEnabled() {
-    static const bool enabled = [] {
-        wchar_t value[8]{};
-        const DWORD length = GetEnvironmentVariableW(L"VECTORXR_MVCAPTURE_OUTPUT", value, 8);
-        return length == 1 && value[0] == L'1';
-    }();
-    return enabled;
-}
-
-// The output mapping, created on first use.
-bool EnsureOutputBlock(State& s) {
-    if (s.output_block) {
-        return true;
-    }
-    wchar_t name[64];
-    OutputMappingName(GetCurrentProcessId(), name);
-    s.output_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(OutputBlock), name);
-    if (!s.output_mapping) {
-        Log("output: CreateFileMapping failed: %lu", GetLastError());
-        return false;
-    }
-    s.output_block = static_cast<OutputBlock*>(MapViewOfFile(s.output_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OutputBlock)));
-    if (!s.output_block) {
-        Log("output: MapViewOfFile failed: %lu", GetLastError());
-        CloseHandle(s.output_mapping);
-        s.output_mapping = nullptr;
-        return false;
-    }
-    std::memset(s.output_block, 0, sizeof(OutputBlock));
-    s.output_block->magic = kOutputMagic;
-    s.output_block->version = kOutputVersion;
-    s.output_block->size = sizeof(OutputBlock);
-    Log("output: the DLSS output is copied for readers (VECTORXR_MVCAPTURE_OUTPUT=1)");
-    return true;
-}
-
-// Readers see valid == 0 for output slot `index` (its stream ended or the device changed).
-void UnpublishOutput(State& s, std::uint32_t index) {
-    if (!s.output_block) {
-        return;
-    }
-    OutputSlot& info = s.output_block->slots[index];
-    InterlockedIncrement64(&info.sequence); // odd: being written
-    MemoryBarrier();
-    info.valid = 0;
-    for (std::uint32_t i = 0; i < kRing; ++i) {
-        info.handle[i] = 0;
-        info.post_handle[i] = 0;
-    }
-    info.post_valid = 0;
-    MemoryBarrier();
-    InterlockedIncrement64(&info.sequence); // even: published
-}
-
 // (Re)starts capture on `device`: the fence, the adapter and empty slots.
 bool InitDevice(State& s, ID3D11Device* device) {
     for (Slot& slot : s.slots) {
@@ -269,10 +175,6 @@ bool InitDevice(State& s, ID3D11Device* device) {
     s.block->slot_count = 0;
     s.block->fence_handle = 0;
     s.round_count = 0;
-    s.pending_slot = -1;
-    for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
-        UnpublishOutput(s, i);
-    }
     for (SlotInfo& info : s.block->slots) {
         info.valid = 0;
         for (std::uint32_t i = 0; i < kRing; ++i) {
@@ -417,7 +319,6 @@ void ReleaseSlot(State& s, std::uint32_t index) {
     }
     MemoryBarrier();
     InterlockedIncrement64(&info.sequence); // even: published
-    UnpublishOutput(s, index);
     CloseSlot(s.slots[index]);
     std::uint32_t count = 0;
     for (std::uint32_t i = 0; i < kMaxSlots; ++i) {
@@ -462,7 +363,6 @@ Slot* FindSlot(State& s, std::uint32_t ordinal, const void* feature, UINT base_x
     }
     // All slots are taken by other streams: reuse the one unused for longest.
     Log("slot %u reused for evaluation %u of the frame (DLSS feature %p)", oldest_index, ordinal, feature);
-    UnpublishOutput(s, oldest_index);
     CloseSlot(*oldest);
     oldest->used = true;
     oldest->key_ordinal = ordinal;
@@ -618,218 +518,12 @@ bool CaptureMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint
     return true;
 }
 
-// Copies `source` into textures[ring], (re)creating the shared ring when its description changed. False when it cannot
-// be captured (logged once per description).
-bool CopyShared(State& s, ID3D11DeviceContext* context, ComPtr<ID3D11Texture2D>* textures, HANDLE* handles,
-                D3D11_TEXTURE2D_DESC& current, D3D11_TEXTURE2D_DESC& failed, std::uint32_t& generation,
-                std::uint32_t ring, ID3D11Resource* resource, const char* what) {
-    ComPtr<ID3D11Texture2D> source;
-    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&source)))) {
-        return false;
-    }
-    D3D11_TEXTURE2D_DESC desc{};
-    source->GetDesc(&desc);
-    if (desc.SampleDesc.Count > 1 || SameDesc(desc, failed)) {
-        return false;
-    }
-    if (!SameDesc(desc, current) || !textures[0]) {
-        generation = ++s.generation_counter; // new handles: readers must not reuse cached ones
-        for (std::uint32_t i = 0; i < kRing; ++i) {
-            if (handles[i]) {
-                CloseHandle(handles[i]);
-                handles[i] = nullptr;
-            }
-            textures[i].Reset();
-        }
-        if (!MakeShared(s.device.Get(), desc, D3D11_BIND_SHADER_RESOURCE, textures, handles)) {
-            Log("%s: could not create shared textures (format %u %ux%u)", what, desc.Format, desc.Width, desc.Height);
-            for (std::uint32_t i = 0; i < kRing; ++i) {
-                if (handles[i]) {
-                    CloseHandle(handles[i]);
-                    handles[i] = nullptr;
-                }
-                textures[i].Reset();
-            }
-            failed = desc;
-            return false;
-        }
-        current = desc;
-        Log("%s: shared %ux%u format %u array %u", what, desc.Width, desc.Height, desc.Format, desc.ArraySize);
-    }
-    context->CopyResource(textures[ring].Get(), source.Get());
-    return true;
-}
-
-// Copies what DLSS wrote into slot.out[ring].
-bool CaptureOutput(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t ring, ID3D11Resource* output) {
-    return CopyShared(s, context, slot.out, slot.out_handle, slot.out_desc, slot.out_failed, slot.out_generation, ring,
-                      output, "output");
-}
-
-std::uint32_t BytesPerPixel(DXGI_FORMAT format) {
-    switch (format) {
-    case DXGI_FORMAT_R16G16_FLOAT:
-    case DXGI_FORMAT_R16G16_TYPELESS:
-        return 4;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-    case DXGI_FORMAT_R32G32_FLOAT:
-    case DXGI_FORMAT_R32G32_TYPELESS:
-        return 8;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        return 16;
-    default:
-        return 0;
-    }
-}
-
-// The preview mapping, created on first use when VECTORXR_MVCAPTURE_PREVIEW=1.
-bool EnsurePreview(State& s) {
-    if (s.preview_view) {
-        return true;
-    }
-    if (s.preview_checked) {
-        return false;
-    }
-    s.preview_checked = true;
-    wchar_t value[8]{};
-    const DWORD length = GetEnvironmentVariableW(L"VECTORXR_MVCAPTURE_PREVIEW", value, 8);
-    if (!(length == 1 && value[0] == L'1')) {
-        return false;
-    }
-    const std::uint64_t total = std::uint64_t(kPreviewHeaderBytes) + std::uint64_t(kPreviewSlots) * kPreviewSlotBytes;
-    wchar_t name[64];
-    PreviewMappingName(GetCurrentProcessId(), name);
-    s.preview_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(total >> 32),
-                                           static_cast<DWORD>(total & 0xffffffffu), name);
-    if (!s.preview_mapping) {
-        Log("preview: CreateFileMapping failed: %lu", GetLastError());
-        return false;
-    }
-    s.preview_view = static_cast<std::uint8_t*>(MapViewOfFile(s.preview_mapping, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(total)));
-    if (!s.preview_view) {
-        Log("preview: MapViewOfFile failed: %lu", GetLastError());
-        CloseHandle(s.preview_mapping);
-        s.preview_mapping = nullptr;
-        return false;
-    }
-    auto* header = reinterpret_cast<PreviewHeader*>(s.preview_view);
-    std::memset(header, 0, sizeof(PreviewHeader));
-    header->magic = kPreviewMagic;
-    header->version = 1;
-    header->header_bytes = kPreviewHeaderBytes;
-    header->slot_bytes = kPreviewSlotBytes;
-    header->slot_count = kPreviewSlots;
-    s.preview = true;
-    Log("preview: motion vectors are copied to the CPU (every 8th evaluation) for debugging tools");
-    return true;
-}
-
-// Copies the newest vectors to a staging texture, and publishes the copy made
-// the time before (it is done by now, so reading it does not stall the game).
-void PreviewMotion(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t index, std::uint32_t ring) {
-    if (index >= kPreviewSlots || !EnsurePreview(s) || ++slot.preview_tick % 8 != 0) {
-        return;
-    }
-    const D3D11_TEXTURE2D_DESC& desc = slot.mv_desc;
-    const std::uint32_t bpp = BytesPerPixel(desc.Format);
-    if (!bpp || desc.ArraySize != 1 || std::uint64_t(desc.Width) * desc.Height * bpp > kPreviewSlotBytes) {
-        return;
-    }
-    if (!slot.preview_stage[0] || !SameDesc(desc, slot.preview_desc)) {
-        ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
-        D3D11_TEXTURE2D_DESC stage = desc;
-        stage.Usage = D3D11_USAGE_STAGING;
-        stage.BindFlags = 0;
-        stage.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        stage.MiscFlags = 0;
-        for (int i = 0; i < 2; ++i) {
-            slot.preview_stage[i].Reset();
-            slot.preview_pending[i] = false;
-            if (!device || FAILED(device->CreateTexture2D(&stage, nullptr, &slot.preview_stage[i]))) {
-                Log("preview: could not create a staging texture (format %u %ux%u)", desc.Format, desc.Width, desc.Height);
-                slot.preview_stage[0].Reset();
-                slot.preview_stage[1].Reset();
-                return;
-            }
-        }
-        slot.preview_desc = desc;
-        slot.preview_next = 0;
-    }
-    // The copy made last time, if the GPU has finished it.
-    const std::uint32_t read = slot.preview_next ^ 1u;
-    if (slot.preview_pending[read]) {
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(context->Map(slot.preview_stage[read].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
-            auto* header = reinterpret_cast<PreviewHeader*>(s.preview_view);
-            PreviewSlot& out = header->slots[index];
-            std::uint8_t* dst = s.preview_view + kPreviewHeaderBytes + std::size_t(index) * kPreviewSlotBytes;
-            InterlockedIncrement64(&out.sequence); // odd: being written
-            MemoryBarrier();
-            const std::size_t row = std::size_t(desc.Width) * bpp;
-            for (UINT y = 0; y < desc.Height; ++y) {
-                std::memcpy(dst + y * row, static_cast<const std::uint8_t*>(mapped.pData) + std::size_t(y) * mapped.RowPitch, row);
-            }
-            out.frame_seq = slot.frame_seq;
-            out.width = desc.Width;
-            out.height = desc.Height;
-            out.format = desc.Format;
-            out.bytes_per_pixel = bpp;
-            MemoryBarrier();
-            InterlockedIncrement64(&out.sequence); // even: published
-            context->Unmap(slot.preview_stage[read].Get(), 0);
-            slot.preview_pending[read] = false;
-        }
-    }
-    context->CopyResource(slot.preview_stage[slot.preview_next].Get(), slot.mv[ring].Get());
-    slot.preview_pending[slot.preview_next] = true;
-    slot.preview_next ^= 1u;
-}
-
 } // namespace
 
 bool Enabled() {
     wchar_t value[8]{};
     const DWORD length = GetEnvironmentVariableW(L"VECTORXR_MVCAPTURE", value, 8);
     return !(length > 0 && length < 8 && value[0] == L'0');
-}
-
-// The texture DLSS wrote for this slot's previous evaluation, copied again now, before this evaluation overwrites it:
-// it holds whatever the game drew over it for that frame (if it draws on that texture), and published in the output
-// mapping next to the copy made when the evaluation returned.
-void PublishLateOutput(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t index) {
-    ID3D11Texture2D* previous = slot.prev_output.Get();
-    const std::uint32_t ring = slot.prev_ring;
-    if (!EnsureOutputBlock(s) ||
-        !CopyShared(s, context, slot.post, slot.post_handle, slot.post_desc, slot.post_failed, slot.post_generation, ring,
-                    previous, "output (late)")) {
-        slot.prev_output.Reset();
-        return;
-    }
-    std::uint64_t fence_value = 0;
-    if (s.fence) {
-        ComPtr<ID3D11DeviceContext4> context4;
-        if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4)))) {
-            fence_value = ++s.fence_value;
-            context4->Signal(s.fence.Get(), fence_value);
-        }
-    }
-    OutputSlot& info = s.output_block->slots[index];
-    InterlockedIncrement64(&info.sequence); // odd: being written
-    MemoryBarrier();
-    for (std::uint32_t i = 0; i < kRing; ++i) {
-        info.post_handle[i] = reinterpret_cast<std::uint64_t>(slot.post_handle[i]);
-    }
-    info.post_frame_seq = slot.prev_frame_seq;
-    info.post_fence_value = fence_value;
-    info.post_ring = ring;
-    info.post_generation = slot.post_generation;
-    info.post_valid = 1;
-    MemoryBarrier();
-    InterlockedIncrement64(&info.sequence); // even: published
-    slot.prev_output.Reset();
 }
 
 void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters) {
@@ -842,7 +536,6 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, c
         return;
     }
     ++s.calls;
-    s.pending_slot = -1;
     if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
         if (s.calls == 1) {
             Log("DLSS was evaluated on a deferred context; not captured");
@@ -907,17 +600,12 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, c
     }
     slot->last_use = s.calls;
     const std::uint32_t ring = (slot->ring + 1) % kRing;
-    if (slot->prev_output) {
-        PublishLateOutput(s, context, *slot, index);
-    }
 
     const bool have_mv = CaptureMotion(s, context, *slot, ring, in.mv);
     const bool have_depth = in.depth && CaptureDepth(s, context, *slot, ring, in.depth);
     if (!have_mv) {
         return;
     }
-
-    PreviewMotion(s, context, *slot, index, ring);
 
     std::uint64_t fence_value = 0;
     if (s.fence) {
@@ -959,69 +647,6 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, c
     info.mv_scale_y = in.mv_scale_y;
     info.reset = in.reset;
     info.generation = slot->generation;
-    MemoryBarrier();
-    InterlockedIncrement64(&info.sequence); // even: published
-    s.pending_slot = static_cast<int>(index);
-}
-
-// Called after the real evaluation: the DLSS output is final now, before the game draws over it.
-void OnEvaluateDone(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, const NVSDK_NGX_Parameter* parameters) {
-    if (!context || !parameters || !OutputEnabled()) {
-        return;
-    }
-    State& s = S();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    if (s.failed || !s.block || s.pending_slot < 0) {
-        return;
-    }
-    const std::uint32_t index = static_cast<std::uint32_t>(s.pending_slot);
-    s.pending_slot = -1;
-    Slot& slot = s.slots[index];
-    if (!slot.used || slot.feature != static_cast<const void*>(feature) || !EnsureOutputBlock(s)) {
-        return;
-    }
-    ID3D11Resource* output = nullptr;
-    if (!Read(parameters, NVSDK_NGX_Parameter_Output, &output) || !output) {
-        return;
-    }
-    const std::uint32_t ring = slot.ring;
-    if (!CaptureOutput(s, context, slot, ring, output)) {
-        return;
-    }
-    // Kept until this slot's next evaluation begins, to be copied again then (PublishLateOutput).
-    slot.prev_output.Reset();
-    if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&slot.prev_output)))) {
-        slot.prev_ring = ring;
-        slot.prev_frame_seq = slot.frame_seq;
-    }
-
-    std::uint64_t fence_value = 0;
-    if (s.fence) {
-        ComPtr<ID3D11DeviceContext4> context4;
-        if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4)))) {
-            fence_value = ++s.fence_value;
-            context4->Signal(s.fence.Get(), fence_value);
-        }
-    }
-
-    OutputSlot& info = s.output_block->slots[index];
-    InterlockedIncrement64(&info.sequence); // odd: being written
-    MemoryBarrier();
-    info.valid = 1;
-    info.ring_index = ring;
-    info.frame_seq = slot.frame_seq;
-    info.fence_value = fence_value;
-    for (std::uint32_t i = 0; i < kRing; ++i) {
-        info.handle[i] = reinterpret_cast<std::uint64_t>(slot.out_handle[i]);
-    }
-    info.width = slot.out_desc.Width;
-    info.height = slot.out_desc.Height;
-    info.format = slot.out_desc.Format;
-    info.array_size = slot.out_desc.ArraySize;
-    info.generation = slot.out_generation;
-    if (s.output_block->slot_count < index + 1) {
-        s.output_block->slot_count = index + 1;
-    }
     MemoryBarrier();
     InterlockedIncrement64(&info.sequence); // even: published
 }

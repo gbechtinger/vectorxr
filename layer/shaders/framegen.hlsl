@@ -74,10 +74,6 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 #define FG_FLAG_STALE_FLOW 1024u
 // The confidence view shows each factor of the trust on its own colour.
 #define FG_FLAG_CONFIDENCE_FACTORS 2048u
-// Synthesis tints in cyan where the newest frame differs from DLSS's output (what the game drew over it); the
-// threshold of 255 is in bits 16-23, and the heat flag shows the difference as a gradient.
-#define FG_FLAG_OVERLAY 4096u
-#define FG_FLAG_OVERLAY_HEAT 8192u
 // Flow passes (FG_PASS_SEARCH, REFINE, FLOW_UNPACK): vectors on flat blocks,
 // and vectors that do not beat no motion, are dropped (see FlowKeep). Always
 // set by the plan (FrameGenTuning::flow_guard).
@@ -1048,8 +1044,6 @@ FG_BIND(6) SamplerState g_linear : register(s0);
 // The eye-shift map (FG_PASS_SHIFT_*) built for this generated frame (or,
 // for a spare, the frame before), Direct3D 12 only, as depth is.
 Texture2D<uint> g_shift : register(t4);
-// DLSS's output for the newest frame, before the game's HUD, displays and menus (FG_FLAG_OVERLAY), Direct3D 12 only.
-Texture2D<float4> g_overlay : register(t5);
 #endif
 #if defined(FG_PASS_SYNTHESIZE_UNORM8)
 FG_BIND(4) FG_FORMAT("rgba8") RWTexture2D<float4> g_output : register(u0);
@@ -1353,23 +1347,6 @@ float4 Synthesize(float2 position, float fraction) {
     } else if (view == FG_VIEW_TINT) {
         result.rgb *= float3(1.0, 0.8, 1.0);
     }
-
-#if !defined(__spirv__)
-    if ((g.options.y & FG_FLAG_OVERLAY) != 0u) {
-        // What the game drew after DLSS (HUD, displays, helmet display, menus) is in the newest frame and not in
-        // DLSS's output: both seen at this pixel, square-rooted (as elsewhere here) to compare darks and brights alike.
-        // The output is linear and the frame goes through the game's tone mapping, so wherever that curve is not the
-        // identity this marks more than the overlay: a research view to see how far it gets.
-        const float2 overlay_uv = position / float2(g.size.xy);
-        const float3 dlss = g_overlay.SampleLevel(g_linear, overlay_uv, 0.0).rgb;
-        const float3 frame = g_current.SampleLevel(g_linear, overlay_uv, 0.0).rgb;
-        const float difference = MaxComponent(abs(Perceptual(dlss) - Perceptual(frame)));
-        const float threshold = max(float((g.options.y >> 16) & 0xffu) / 255.0, 1.0 / 255.0);
-        const float amount = (g.options.y & FG_FLAG_OVERLAY_HEAT) != 0u ? saturate(0.5 * difference / threshold)
-                                                                       : step(threshold, difference);
-        result.rgb = lerp(result.rgb, float3(0.0, 1.0, 1.0), 0.7 * amount);
-    }
-#endif
 
     if ((g.options.y & FG_FLAG_SRGB_ENCODE) != 0u) {
         result.rgb = LinearToSrgb(result.rgb);

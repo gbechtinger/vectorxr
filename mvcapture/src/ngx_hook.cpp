@@ -26,13 +26,7 @@ NVSDK_NGX_Result NVSDK_CONV EvaluateDetour(ID3D11DeviceContext* context, const N
     } catch (...) {
         // Capture must never change what the game sees.
     }
-    const NVSDK_NGX_Result result = g_original(context, handle, parameters, callback);
-    try {
-        OnEvaluateDone(context, handle, parameters);
-    } catch (...) {
-        // Capture must never change what the game sees.
-    }
-    return result;
+    return g_original(context, handle, parameters, callback);
 }
 
 // Logs the module's path and the exports that matter for finding the hook point.

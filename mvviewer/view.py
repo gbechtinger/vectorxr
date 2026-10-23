@@ -12,10 +12,6 @@ Fluxo:
 Requisitos:  pip install numpy opencv-python
 Uso:         python mv_viewer.py [pid] [--max 4.0] [--zoom 1.0] [--latest]
 Teclas:      d      alterna motion vectors <-> depth
-             c      percorre: saida do DLSS logo apos o DLSS -> a mesma textura copiada de novo na
-                    avaliacao seguinte (tardia: mostra o que o jogo desenhou nela) -> diferenca entre
-                    as duas (onde o jogo desenhou) -> volta aos vetores; precisa de
-                    VECTORXR_MVCAPTURE_OUTPUT=1 no ambiente do DCS e do dxgi.dll novo
              + / -  muda a magnitude que satura o brilho (modo MV)
              i      inverte o colormap (modo depth)
              l      alterna entre o ring mais recente e o anterior
@@ -42,14 +38,6 @@ SLOT_BASE = 40
 SLOT_SIZE = 152
 BLOCK_SIZE = 648
 RING = 3
-# Mapeamento da saida do DLSS ("Local\\VectorXR.MvCapture.Output.<pid>"): OutputBlock = magic, version, size,
-# slot_count e 4 OutputSlot de 80 bytes (sequence, valid, ring, frame_seq, fence, handle[3], w, h, fmt, array,
-# generation, reserved).
-OUT_HEADER_FMT = "<IIII"
-OUT_SLOT_FMT = "<QIIQQ3Q6I3QQQ4I"  # + a segunda copia ("tardia"): post_handle[3], post_frame_seq, post_fence, post_ring, post_valid, post_generation, reservado
-OUT_SLOT_BASE = 16
-OUT_SLOT_SIZE = 136
-OUT_BLOCK_SIZE = 16 + 4 * 136
 MAX_SLOTS = (BLOCK_SIZE - SLOT_BASE) // SLOT_SIZE  # 4
 
 # DXGI_FORMAT -> (nome, dtype numpy, canais, divisor para normalizar)
@@ -75,36 +63,6 @@ FORMATS = {
     56: ("R16_UNORM", np.uint16, 1, 65535.0),
     61: ("R8_UNORM", np.uint8, 1, 255.0),
 }
-
-# Formatos da saida do DLSS (cor): DXGI_FORMAT -> (nome, dtype, canais, divisor, ordem, linear)
-# ordem "rgb": canais R,G,B,A; "bgr": B,G,R,A. linear: float/HDR, mostrado com gamma 1/2.2 (sRGB aproximado).
-OUTPUT_FORMATS = {
-    2:  ("R32G32B32A32_FLOAT", np.float32, 4, 1.0, "rgb", True),
-    9:  ("R16G16B16A16_TYPELESS(float?)", np.float16, 4, 1.0, "rgb", True),
-    10: ("R16G16B16A16_FLOAT", np.float16, 4, 1.0, "rgb", True),
-    11: ("R16G16B16A16_UNORM", np.uint16, 4, 65535.0, "rgb", False),
-    27: ("R8G8B8A8_TYPELESS", np.uint8, 4, 255.0, "rgb", False),
-    28: ("R8G8B8A8_UNORM", np.uint8, 4, 255.0, "rgb", False),
-    29: ("R8G8B8A8_UNORM_SRGB", np.uint8, 4, 255.0, "rgb", False),
-    87: ("B8G8R8A8_UNORM", np.uint8, 4, 255.0, "bgr", False),
-    90: ("B8G8R8A8_TYPELESS", np.uint8, 4, 255.0, "bgr", False),
-    91: ("B8G8R8A8_UNORM_SRGB", np.uint8, 4, 255.0, "bgr", False),
-}
-PACKED_OUTPUT_FORMATS = {24: "R10G10B10A2_UNORM", 26: "R11G11B10_FLOAT"}
-
-
-def decode_r11g11b10(v):
-    """R11G11B10_FLOAT (uint32 por pixel) -> float32 (H, W, 3) em RGB."""
-    def unpack(bits, mant_bits):
-        e = (bits >> mant_bits).astype(np.int32)
-        m = (bits & ((1 << mant_bits) - 1)).astype(np.float32) / float(1 << mant_bits)
-        val = np.where(e == 0, m * 2.0 ** -14, (1.0 + m) * np.exp2((e - 15).astype(np.float32)))
-        return np.where(e == 31, 65504.0, val).astype(np.float32)
-    r = unpack(v & 0x7FF, 6)
-    g = unpack((v >> 11) & 0x7FF, 6)
-    b = unpack((v >> 22) & 0x3FF, 5)
-    return np.dstack([r, g, b])
-
 
 # ---------------------------------------------------------------- win32 -----
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -250,41 +208,6 @@ class Capture:
                                "tente rodar como administrador")
         self.dev, self.ctx = create_device(*self.luid)
         self.cache = {}  # (slot, ring) -> dict
-        self.out_buf = None
-
-    def open_output(self):
-        """Abre o mapeamento da saida do DLSS quando ele existir (o DCS precisa de VECTORXR_MVCAPTURE_OUTPUT=1)."""
-        if self.out_buf is not None:
-            return True
-        h = k32.OpenFileMappingW(FILE_MAP_READ, False, f"Local\\VectorXR.MvCapture.Output.{self.pid}")
-        if not h:
-            return False
-        addr = k32.MapViewOfFile(h, FILE_MAP_READ, 0, 0, OUT_BLOCK_SIZE)
-        if not addr:
-            return False
-        buf = (ctypes.c_char * OUT_BLOCK_SIZE).from_address(addr)
-        if struct.unpack_from(OUT_HEADER_FMT, buf, 0)[2] != OUT_BLOCK_SIZE:
-            print("aviso: o mapeamento da saida tem tamanho diferente do esperado; os offsets podem estar errados")
-        self.out_buf = buf
-        return True
-
-    def read_output_slot(self, i):
-        if not self.open_output():
-            return None
-        o = OUT_SLOT_BASE + i * OUT_SLOT_SIZE
-        for _ in range(200):
-            s1 = struct.unpack_from("<Q", self.out_buf, o)[0]
-            if s1 & 1:
-                continue
-            raw = bytes(self.out_buf[o:o + OUT_SLOT_SIZE])
-            s2 = struct.unpack_from("<Q", self.out_buf, o)[0]
-            if s1 == s2:
-                f = struct.unpack(OUT_SLOT_FMT, raw)
-                return {"valid": f[1], "ring": f[2], "frame_seq": f[3], "fence": f[4], "output_handle": f[5:8],
-                        "width": f[8], "height": f[9], "format": f[10], "array": f[11], "generation": f[12],
-                        "post_handle": f[14:17], "post_seq": f[17], "post_fence": f[18], "post_ring": f[19],
-                        "post_valid": f[20], "post_generation": f[21]}
-        return None
 
     def header(self):
         return struct.unpack_from(HEADER_FMT, self.buf, 0)
@@ -309,10 +232,6 @@ class Capture:
 
     @staticmethod
     def _sig(info, kind):
-        if kind == "output":
-            return (kind, info["width"], info["height"], info["format"], info["generation"])
-        if kind == "post":
-            return (kind, info["width"], info["height"], info["format"], info["post_generation"])
         return (kind, info["width"], info["height"], info["mv_fmt"], info["depth_fmt"], info["depth_conv"])
 
     def _open(self, key, remote, info, kind):
@@ -346,7 +265,7 @@ class Capture:
                            "tex": tex.value, "stg": stg.value,
                            "w": desc.Width, "h": desc.Height, "fmt": desc.Format}
 
-    def grab(self, slot, info, ring, kind="mv", raw=False):
+    def grab(self, slot, info, ring, kind="mv"):
         """kind='mv': float32 (H, W, 2) em pixels (antes do mv_scale).
         kind='depth': float32 (H, W) com os valores crus do buffer de profundidade."""
         remote = info[kind + "_handle"][ring]
@@ -360,17 +279,11 @@ class Capture:
             ent = self.cache[key]
 
         self.last_fmt = ent["fmt"]
-        if kind in ("output", "post"):
-            fmt = ("output",)
-        else:
-            fmt = FORMATS.get(ent["fmt"])
+        fmt = FORMATS.get(ent["fmt"])
         if not fmt:
             raise RuntimeError(f"formato DXGI {ent['fmt']} nao suportado; adicione em FORMATS")
-        if kind not in ("output", "post"):
-            _, dtype, ch, div = fmt
+        _, dtype, ch, div = fmt
 
-        if kind in ("output", "post"):
-            return self._read_output(ent, raw)
         vcall(self.ctx, CTX_CopyResource, [ctypes.c_void_p, ctypes.c_void_p], ent["stg"], ent["tex"], restype=None)
         m = MAPPED()
         hr = vcall(self.ctx, CTX_Map,
@@ -393,55 +306,6 @@ class Capture:
 
 
 # ---------------------------------------------------------- visualizacao ----
-def _read_output(self, ent, raw=False):
-    """Copia a saida do DLSS para a CPU e devolve uint8 BGR (H, W, 3) pronto para o OpenCV
-    (ou, com raw=True, (rgb float32 sem corte, linear?) para comparar duas copias)."""
-    fmt_id = ent["fmt"]
-    packed = fmt_id in PACKED_OUTPUT_FORMATS
-    spec = OUTPUT_FORMATS.get(fmt_id)
-    if not spec and not packed:
-        raise RuntimeError(f"formato DXGI {fmt_id} da saida nao suportado; adicione em OUTPUT_FORMATS")
-    vcall(self.ctx, CTX_CopyResource, [ctypes.c_void_p, ctypes.c_void_p], ent["stg"], ent["tex"], restype=None)
-    m = MAPPED()
-    hr = vcall(self.ctx, CTX_Map,
-               [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(MAPPED)],
-               ent["stg"], 0, D3D11_MAP_READ, 0, ctypes.byref(m))
-    if hr != 0:
-        raise RuntimeError(f"Map falhou: 0x{hr & 0xFFFFFFFF:08x}")
-    try:
-        w, h = ent["w"], ent["h"]
-        buffer = (ctypes.c_ubyte * (m.RowPitch * h)).from_address(m.pData)
-        data = np.frombuffer(buffer, dtype=np.uint8).reshape(h, m.RowPitch)
-        if packed:
-            v = np.ascontiguousarray(data[:, :w * 4]).view(np.uint32).reshape(h, w)
-            if fmt_id == 26:
-                rgb = decode_r11g11b10(v)
-                linear = True
-            else:
-                rgb = np.dstack([(v & 0x3FF), (v >> 10) & 0x3FF, (v >> 20) & 0x3FF]).astype(np.float32) / 1023.0
-                linear = False
-        else:
-            _, dtype, ch, div, order, linear = spec
-            bpp = np.dtype(dtype).itemsize * ch
-            arr = np.ascontiguousarray(data[:, :w * bpp]).view(dtype).reshape(h, w, ch)
-            rgb = arr[:, :, :3].astype(np.float32) / div
-            if order == "bgr":
-                rgb = rgb[:, :, ::-1]
-    finally:
-        vcall(self.ctx, CTX_Unmap, [ctypes.c_void_p, ctypes.c_uint], ent["stg"], 0, restype=None)
-    rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
-    if raw:
-        return rgb, linear
-    rgb = np.clip(rgb, 0.0, 1.0)
-    if linear:
-        rgb = rgb ** (1.0 / 2.2)
-    return np.ascontiguousarray((rgb[:, :, ::-1] * 255.0 + 0.5).astype(np.uint8))
-
-
-Capture._read_output = _read_output
-
-
-
 def mv_to_bgr(mv, scale, max_px):
     dx = np.nan_to_num(mv[..., 0]) * scale[0]
     dy = np.nan_to_num(mv[..., 1]) * scale[1]
@@ -493,7 +357,7 @@ def main():
 
     max_px = args.max
     use_latest = args.latest
-    mode = "mv"       # "mv", "depth" ou "output" (saida do DLSS)
+    mode = "mv"       # "mv" ou "depth"
     invert = False    # inverte o colormap do depth
     last = {}   # slot -> (frame_seq, imagem)
     t0, frames = time.time(), 0
@@ -504,67 +368,6 @@ def main():
         for i in range(min(hdr[3], MAX_SLOTS)):
             info = cap.read_slot(i)
             if not info or not info["valid"]:
-                continue
-            if mode in ("output", "late", "diff"):
-                oinfo = cap.read_output_slot(i)
-
-                def message(lines):
-                    msg = np.zeros((120, 640, 3), np.uint8)
-                    for n, t in enumerate(lines):
-                        cv2.putText(msg, t, (8, 40 + 24 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
-                                    cv2.LINE_AA)
-                    return msg
-
-                problem = None
-                if not oinfo or not oinfo["valid"]:
-                    problem = [f"slot {i}: sem captura da saida do DLSS",
-                               "o DCS precisa de VECTORXR_MVCAPTURE_OUTPUT=1 e do dxgi.dll novo"]
-                elif mode != "output" and not oinfo["post_valid"]:
-                    problem = [f"slot {i}: sem a copia tardia da saida (ainda)",
-                               "ela aparece na avaliacao seguinte do DLSS; precisa do dxgi.dll novo"]
-                elif mode == "diff" and not 0 <= oinfo["frame_seq"] - oinfo["post_seq"] <= 2:
-                    problem = [f"slot {i}: as duas copias estao fora de sincronia",
-                               f"saida {oinfo['frame_seq']}, tardia {oinfo['post_seq']}"]
-                if problem:
-                    if i not in last or last[i][2] != ("problema", mode, problem[0]):
-                        last[i] = (-1, message(problem), ("problema", mode, problem[0]))
-                    tiles.append(last[i][1])
-                    continue
-                identity = (oinfo["frame_seq"], oinfo["post_seq"])
-                if i not in last or last[i][0] != identity or last[i][2] != ("saida", mode):
-                    try:
-                        if mode == "output":
-                            ring = oinfo["ring"] if use_latest else (oinfo["ring"] - 1) % RING
-                            img = cap.grab(i, oinfo, ring, "output")
-                            title = f"SAIDA DLSS (logo apos o DLSS) slot {i}  frame {oinfo['frame_seq']}"
-                        elif mode == "late":
-                            img = cap.grab(i, oinfo, oinfo["post_ring"], "post")
-                            title = f"SAIDA DLSS (tardia, antes da proxima avaliacao) slot {i}  frame {oinfo['post_seq']}"
-                        else:
-                            delta = oinfo["frame_seq"] - oinfo["post_seq"]
-                            early, linear = cap.grab(i, oinfo, (oinfo["ring"] - delta) % RING, "output", raw=True)
-                            late, _ = cap.grab(i, oinfo, oinfo["post_ring"], "post", raw=True)
-                            diff = np.abs(late - early).max(axis=2)
-                            changed = float((diff > 1e-3).mean())
-                            level = np.clip(diff * 8.0, 0.0, 1.0) ** (1.0 / 2.2)
-                            img = cv2.applyColorMap((level * 255.0).astype(np.uint8), cv2.COLORMAP_INFERNO)
-                            title = (f"DIFERENCA tardia - logo apos o DLSS, slot {i}  frame {oinfo['post_seq']}  "
-                                     f"{changed * 100:.2f}% dos pixels mudaram")
-                    except Exception as e:
-                        print(f"slot {i}: {e}")
-                        img = None
-                    if img is not None:
-                        name = OUTPUT_FORMATS.get(cap.last_fmt, (PACKED_OUTPUT_FORMATS.get(cap.last_fmt, f"fmt {cap.last_fmt}"),))[0]
-                        img = np.ascontiguousarray(img)
-                        for n, t in enumerate([title, f"{img.shape[1]}x{img.shape[0]}  {name}"]):
-                            cv2.putText(img, t, (8, 20 + 18 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                                        cv2.LINE_AA)
-                        last[i] = (identity, img, ("saida", mode))
-                        frames += 1
-                    else:
-                        last.pop(i, None)
-                if i in last:
-                    tiles.append(last[i][1])
                 continue
             if i not in last or last[i][0] != info["frame_seq"] or last[i][2] != (max_px, mode, invert):
                 ring = info["ring"] if use_latest else (info["ring"] - 1) % RING
@@ -620,12 +423,6 @@ def main():
             max_px /= 1.5
         elif k == ord("d"):
             mode = "depth" if mode == "mv" else "mv"
-            last.clear()
-            print("modo:", mode)
-        elif k == ord("c"):
-            # mv -> saida logo apos o DLSS -> saida tardia -> diferenca -> mv
-            mode = {"mv": "output", "depth": "output", "output": "late", "late": "diff"}.get(mode, "mv")
-            last.clear()
             print("modo:", mode)
         elif k == ord("i"):
             invert = not invert

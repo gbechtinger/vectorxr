@@ -134,9 +134,6 @@ enum class FrameGenTextureKind : std::uint8_t {
     // The game's motion vectors for the newest frame (kFlowGame's input), as
     // the game wrote them, at the size of its render target.
     kGameMotion,
-    // The image DLSS wrote for the newest frame, before the game drew its HUD, displays and menus over it
-    // (FrameGenViewRequest::game_output), as the game's capture DLL copied it.
-    kGameOutput,
 };
 
 // The flow level the optical flow hardware fills: a 4x4 grid on the
@@ -188,11 +185,6 @@ inline constexpr std::uint32_t kFrameGenFlagStaleFlow = 1024u;
 // The confidence view shows each factor of the trust on its own colour
 // (FrameGenTuning::confidence_factors, research).
 inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 2048u;
-// Synthesis tints in cyan where the newest frame differs from DLSS's output (the overlay the game drew after DLSS):
-// FrameGenTuning::overlay_view, research. Bits 16-23 hold the threshold (of 255); the heat flag shows the difference
-// as a gradient instead of a mask.
-inline constexpr std::uint32_t kFrameGenFlagOverlay = 4096u;
-inline constexpr std::uint32_t kFrameGenFlagOverlayHeat = 8192u;
 // Flow passes drop vectors on flat blocks and vectors that do not beat no
 // motion (FrameGenTuning::flow_guard).
 inline constexpr std::uint32_t kFrameGenFlagFlowGuard = 16384u;
@@ -418,8 +410,6 @@ struct FrameGenViewRequest {
     // presenter from the capture library; the backend clears `valid` when it
     // cannot use them, and then measures the motion as before).
     FrameGenGameMotion game_motion;
-    // What DLSS wrote for the newest frame, before the game's HUD, displays and menus (research: overlay_view).
-    FrameGenGameMotion game_output;
 };
 
 struct FrameGenTuning {
@@ -461,10 +451,6 @@ struct FrameGenTuning {
     bool cross_fade{false};
     // Research: the confidence view splits the trust by factor (colours: see Synthesize).
     bool confidence_factors{false};
-    // Research: 1 tints in cyan the pixels where the newest frame differs from DLSS's output (what the game drew
-    // after DLSS), 2 shows the difference as a gradient; the threshold is of 255, in perceptual (square root) values.
-    std::uint8_t overlay_view{0};
-    std::uint8_t overlay_threshold{40};
     // Flow passes keep zero motion on flat blocks and where a vector does not
     // clearly beat no motion (ghosting of content copied into plain
     // background). Always on.

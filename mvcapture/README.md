@@ -72,23 +72,6 @@ luma pair and falls back to zero motion where the vector does not match
 measure the motion as before. If the eyes look swapped, add
 `VECTORXR_FRAMEGEN_GAME_MOTION_SWAP=1`. Depth is not used yet.
 
-## Seeing the vectors (debug preview)
-
-The shared block only holds metadata and GPU handles, so an external program
-cannot read the pixels from it. For debugging, set
-`VECTORXR_MVCAPTURE_PREVIEW=1` in the game's environment: the DLL then copies
-every 8th evaluation's vectors (two eyes) to a second mapping,
-`Local\VectorXR.MvCapture.Preview.<pid>` (layout in `shared.h`, `PreviewHeader`),
-without waiting for the GPU. `tools/mvcapture_viewer.py` shows them (colour =
-direction, brightness = length):
-
-```
-pip install numpy opencv-python psutil
-python mvviewer/view.py
-```
-
-Leave the variable unset for normal play: the layer does not use the preview.
-
 ## Generating frames only while DLSS runs (optional, off by default)
 
 `VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1` (in the environment of the VR app and the game) makes Frame Generation generate
@@ -97,30 +80,3 @@ without a DLSS session) the game's frames are shown as they are, with no interpo
 quality. Frame Generation stays engaged meanwhile (so the game is still paced at half the refresh rate and nothing
 switches on or off), and generation resumes once about twenty new evaluations have come in. The log says when it
 switches. Without the capture DLL nothing is generated with this option on.
-
-## Capturing DLSS's output (optional, off by default)
-
-`VECTORXR_MVCAPTURE_OUTPUT=1` in the game's environment makes the DLL also copy the image DLSS writes (its `Output`
-parameter) right after each evaluation returns, before the game draws anything over it (HUD, displays, menus, a
-helmet-mounted display). Compared with the image the game finally submits, it shows where those things are.
-
-It lives in its own mapping, `Local\VectorXR.MvCapture.Output.<pid>` (`OutputBlock` in `mvcapture/shared.h`, read with
-`OutputReader`), so the main block and everything that reads it stay as they are. Slots are the main block's slots, and
-the textures are ordered by the same shared fence. It costs a copy of the full output image per evaluation and video
-memory for three of them per eye, which is why it is opt-in. Nothing in the layer reads it yet.
-
-With `VECTORXR_MVCAPTURE_OUTPUT=1` the DLL also keeps the game's output texture of each evaluation and copies it again at
-the start of the same slot's next evaluation (the "late" copy, `OutputSlot::post_*`, output mapping version 2). If the
-game draws its HUD, displays and menus on that texture before tone mapping, the late copy has them and its difference
-from the copy made right after DLSS is exactly the overlay, in the same linear colour space. `mvviewer`'s `c` key shows
-both copies and their difference. The late copy of a frame is only there once the next evaluation of that eye begins.
-
-## Seeing what the game drew after DLSS (research)
-
-With `VECTORXR_MVCAPTURE_OUTPUT=1` in the game and `VECTORXR_FRAMEGEN_OVERLAY_VIEW=1` in the VR app's environment,
-generated frames are tinted cyan where the newest frame differs from DLSS's output, which is where the game drew its
-HUD, displays, helmet display and menus after DLSS. `2` shows the difference as a gradient instead of a mask, and
-`VECTORXR_FRAMEGEN_OVERLAY_THRESHOLD` (of 255, default 40, in square-root values) sets where the mask starts.
-DLSS's output is linear and the final frame has the game's tone mapping, so this marks more than the overlay wherever
-that curve is not the identity; it is a view to see how far a plain comparison gets, and changes nothing else.
-Direct3D 12 only, interpolation and extrapolation alike; the log says when the output was found.
