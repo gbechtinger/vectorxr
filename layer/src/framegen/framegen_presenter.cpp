@@ -1498,9 +1498,7 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
                 logger_->Info("Frame Generation found the game's motion vectors: " + std::to_string(motion.width) + "x" +
                               std::to_string(motion.height) + " format " + std::to_string(motion.format) + ", render " +
                               std::to_string(motion.render_width) + "x" + std::to_string(motion.render_height) +
-                              ", scale " + std::to_string(motion.scale_x) + "," + std::to_string(motion.scale_y) +
-                              ", contrast weight " + std::to_string(game_contrast_) + ", prior " +
-                              std::to_string(game_prior_) + (game_motion_flags_ ? ", flags " + std::to_string(game_motion_flags_) : ""));
+                              ", scale " + std::to_string(motion.scale_x) + "," + std::to_string(motion.scale_y));
             }
         }
     }
