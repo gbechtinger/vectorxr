@@ -427,10 +427,7 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         game.constants.tuning = {motion.scale_x / std::max(render_width, 1.0f), motion.scale_y / std::max(render_height, 1.0f),
                                  render_width, render_height};
         game.constants.options[0] = motion.base_x;
-        // flags in bits 0-7, the prior in thousandths in bits 8-15, the contrast weight in quarters in bits 16-23
-        game.constants.options[1] = (motion.flags & 0xffu) |
-                                    (static_cast<std::uint32_t>(std::clamp(motion.prior * 1000.0f + 0.5f, 0.0f, 255.0f)) << 8) |
-                                    (static_cast<std::uint32_t>(std::clamp(motion.contrast * 4.0f + 0.5f, 0.0f, 255.0f)) << 16);
+        game.constants.options[1] = motion.flags;
         game.constants.options[2] = motion.base_y;
         game.constants.options[3] = 1u << (plan.final_flow_level - 1);
         plan.dispatches.push_back(game);

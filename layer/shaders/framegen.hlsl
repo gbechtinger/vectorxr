@@ -1962,6 +1962,7 @@ FG_BIND(4) FG_FORMAT("rgba16f") RWTexture2D<float4> g_flow : register(u0);
 // tuning.xy: uv of the view per unit of a vector; tuning.zw: the render
 // region in texels; options.x, options.z: its origin in the motion texture;
 // options.w: luma texels per cell side.
+#define FG_GAME_PRIOR 0.02
 #define FG_GAME_SPOTS 5
 static const float2 kGameSpots[FG_GAME_SPOTS] = {float2(0.5, 0.5), float2(0.25, 0.25), float2(0.75, 0.25),
                                                  float2(0.25, 0.75), float2(0.75, 0.75)};
@@ -1985,30 +1986,12 @@ bool GameVector(float2 uv, out float2 toward_previous) {
     return all(abs(toward_previous) < 1.0);
 }
 
-// How sharply a luma texel differs from its right and lower neighbours: flat sky is 0, the edge of a letter is large.
-float LumaContrast(Texture2D<float4> luma, int2 p, int2 extent) {
-    const float centre = luma.Load(int3(p, 0)).r;
-    const float right = luma.Load(int3(min(p + int2(1, 0), extent - 1), 0)).r;
-    const float below = luma.Load(int3(min(p + int2(0, 1), extent - 1), 0)).r;
-    if (centre < 0.0 || right < 0.0 || below < 0.0) {
-        return 0.0;
-    }
-    return max(abs(centre - right), abs(centre - below));
-}
-
 // The cost of the previous frame's content `offset` luma texels back over
 // the block of `scale` x `scale` texels of `cell`, as FG_PASS_FLOW_UNPACK
 // scores a vector.
-// Returns x: the cost with high-contrast texels weighted up (what decides), y: the plain cost (what the flow reports).
-// The weight is 1 + contrast * (bits 16-23 of options.y, in quarters), taken from the larger of the newest frame's
-// contrast at the texel and the previous frame's where the vector points, so content that is not there in both
-// counts however flat its surroundings are.
-float2 MatchCost(int2 cell, int scale, int2 extent, int2 offset) {
-    const float weight_scale = float((g.options.y >> 16) & 0xffu) * 0.25;
+float MatchCost(int2 cell, int scale, int2 extent, int2 offset) {
     float sum = 0.0;
     float count = 0.0;
-    float weighted_sum = 0.0;
-    float weighted_count = 0.0;
     [loop]
     for (int y = 0; y < scale; ++y) {
         [loop]
@@ -2020,21 +2003,11 @@ float2 MatchCost(int2 cell, int scale, int2 extent, int2 offset) {
             const float current = g_luma_current.Load(int3(q, 0)).r;
             const int2 s = q - offset;
             const float previous = any(s < 0) || any(s >= extent) ? -1.0 : g_luma_previous.Load(int3(s, 0)).r;
-            const float difference = previous < 0.0 ? FG_INVALID_PENALTY : abs(current - previous);
-            float weight = 1.0;
-            if (weight_scale > 0.0) {
-                const float edge = max(LumaContrast(g_luma_current, q, extent),
-                                       previous < 0.0 ? 0.0 : LumaContrast(g_luma_previous, s, extent));
-                weight += weight_scale * edge;
-            }
-            sum += difference;
+            sum += previous < 0.0 ? FG_INVALID_PENALTY : abs(current - previous);
             count += 1.0;
-            weighted_sum += weight * difference;
-            weighted_count += weight;
         }
     }
-    const float penalty = FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
-    return float2(weighted_sum / max(weighted_count, 1.0) + penalty, sum / max(count, 1.0) + penalty);
+    return sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
 }
 
 [numthreads(8, 8, 1)]
@@ -2072,10 +2045,8 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     }
     const float zero = zero_count >= 0.5 * max(total, 1.0) ? zero_sum / zero_count : -1.0;
 
-    const float2 no_motion = MatchCost(cell, scale, extent, int2(0, 0));
-    const float no_motion_cost = no_motion.y;
+    const float no_motion_cost = MatchCost(cell, scale, extent, int2(0, 0));
     float game_cost = 1.0e9;
-    float game_weighted = 1.0e9;
     float2 game_d = float2(0.0, 0.0);
     const float2 corner = float2(cell * scale);
     [unroll]
@@ -2088,16 +2059,14 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
             continue;
         }
         const float2 d = (spot - newest_uv) * extent_f;
-        const float2 cost = MatchCost(cell, scale, extent, int2(round(d)));
-        if (cost.x < game_weighted) {
-            game_weighted = cost.x;
-            game_cost = cost.y;
+        const float cost = MatchCost(cell, scale, extent, int2(round(d)));
+        if (cost < game_cost) {
+            game_cost = cost;
             game_d = d;
         }
     }
     const bool force_game = (g.options.y & 1u) != 0u;
-    const float prior = float((g.options.y >> 8) & 0xffu) * 0.001;
-    const bool use_game = game_cost < 1.0e8 && (force_game || game_weighted <= no_motion.x + prior);
+    const bool use_game = game_cost < 1.0e8 && (force_game || game_cost <= no_motion_cost + FG_GAME_PRIOR);
     g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f, use_game ? game_cost : no_motion_cost, zero);
 }
 #endif
