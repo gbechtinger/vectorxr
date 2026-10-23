@@ -120,6 +120,8 @@ static const float kDepthScaleProbes[FG_SCALE_PROBES] = {0.7, 0.8, 0.9, 1.0, 1.1
 #define FG_PATCH_RADIUS 2
 #define FG_INVALID_PENALTY 0.25
 #define FG_MOTION_PENALTY 0.05
+// Added to the cost of a cell FG_PASS_FLOW_GAME pinned to no motion: the filter keeps its vector as it is.
+#define FG_PINNED_COST 4.0
 // Flow guard. A block whose luma (square-root domain) varies by less than the
 // flat range has no texture to measure motion with: dithering, banding or a
 // vignette over a plain background make every vector cost about the same, and
@@ -929,7 +931,15 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     [unroll]
     for (int i = 0; i < 9; ++i) {
         const int2 q = clamp(int2(id.xy) + int2(i % 3 - 1, i / 3 - 1), int2(0, 0), limit);
-        samples[i] = Rigid(g_flow_in.Load(int3(q, 0)), q, pixels, rigid[i]);
+        float4 flow = g_flow_in.Load(int3(q, 0));
+        if (flow.z >= 0.5 * FG_PINNED_COST) {
+            flow.z -= FG_PINNED_COST;
+        }
+        samples[i] = Rigid(flow, q, pixels, rigid[i]);
+    }
+    if (g_flow_in.Load(int3(id.xy, 0)).z >= 0.5 * FG_PINNED_COST) {
+        g_flow_out[id.xy] = float4(0.0, 0.0, max(samples[4].z, 0.0), 1.0);
+        return;
     }
     int chosen = 4;
     float chosen_score = 1e30;
@@ -2084,7 +2094,12 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     const bool force_game = (g.options.y & 1u) != 0u;
     const float prior = float((g.options.y >> 8) & 0xffu) * 0.001;
     const bool use_game = game_cost < 1.0e8 && (force_game || game_weighted <= no_motion.x + prior);
-    g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f, use_game ? game_cost : no_motion_cost, zero);
+    // Pinned: the plain cost would have kept the game's vector, and the contrast-weighted one says no motion (text
+    // over flat sky takes the sky's vector otherwise). FG_PASS_FILTER's median would outvote such a thin cell with
+    // the sky's vector around it, so the cell is marked by FG_PINNED_COST added to its cost.
+    const bool pinned = game_cost < 1.0e8 && !use_game && game_cost <= no_motion_cost + prior;
+    g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f,
+                           (use_game ? game_cost : no_motion_cost) + (pinned ? FG_PINNED_COST : 0.0), zero);
 }
 #endif
 
