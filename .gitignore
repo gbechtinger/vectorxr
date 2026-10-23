@@ -36,3 +36,4 @@ logs/
 
 out/
 .vs/
+mvcapture/include/nvsdk_ngx*.h
