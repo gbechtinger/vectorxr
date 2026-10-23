@@ -417,6 +417,15 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         // matches the images better; FLIP reverses the vectors' direction.
         const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
         const char* flip = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FLIP");
+        // Texels of high contrast count more in the match of the game's vectors (0 counts all alike), so text over
+        // flat sky does not take the sky's vector; PRIOR is how much worse than no motion the game's vector may
+        // match and still win.
+        if (const char* contrast = std::getenv("VECTORXR_FRAMEGEN_GAME_CONTRAST")) {
+            game_contrast_ = std::clamp(static_cast<float>(std::atof(contrast)), 0.0f, 60.0f);
+        }
+        if (const char* prior = std::getenv("VECTORXR_FRAMEGEN_GAME_PRIOR")) {
+            game_prior_ = std::clamp(static_cast<float>(std::atof(prior)), 0.0f, 0.25f);
+        }
         game_motion_flags_ = (force && std::string(force) == "1" ? 1u : 0u) | (flip && std::string(flip) == "1" ? 2u : 0u);
     }
     gpu_frames_ahead_ = 1;
@@ -3805,6 +3814,8 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     snapshot.releases == record->second.captured_releases) {
                     submission.request.game_motion = snapshot.motion;
                     submission.request.game_motion.flags = game_motion_flags_;
+                    submission.request.game_motion.contrast = game_contrast_;
+                    submission.request.game_motion.prior = game_prior_;
                     ++game_motion_sent_;
                 } else if (g_game_motion_dll_seen) {
                     ++game_motion_missing_;

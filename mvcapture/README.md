@@ -80,3 +80,11 @@ without a DLSS session) the game's frames are shown as they are, with no interpo
 quality. Frame Generation stays engaged meanwhile (so the game is still paced at half the refresh rate and nothing
 switches on or off), and generation resumes once about twenty new evaluations have come in. The log says when it
 switches. Without the capture DLL nothing is generated with this option on.
+
+## Text drawn over flat sky (HUD)
+
+The game's vectors say nothing about what it draws after DLSS, and flat sky matches any vector, so HUD text over the
+sky could take the sky's vector and show twice while the nose moves. The match cost of the game's vectors therefore
+counts high-contrast texels more than flat ones, so no motion wins on the text. `VECTORXR_FRAMEGEN_GAME_CONTRAST`
+(default 8, 0 counts every texel alike) sets that weight, and `VECTORXR_FRAMEGEN_GAME_PRIOR` (default 0.02) how much
+worse than no motion the game's vector may match and still be kept. Both are read by the VR app at start.

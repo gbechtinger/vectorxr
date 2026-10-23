@@ -367,6 +367,11 @@ struct FrameGenGameMotion {
     // best of the game's vectors even where no motion matches better, bit 1
     // reverses their direction.
     std::uint32_t flags{0};
+    // How much the match cost of a block counts its high-contrast texels over its flat ones (0: all alike), and
+    // how much worse than no motion the game's best vector may match and still be kept. Plain flat background
+    // (sky) matches any vector, so text drawn over it after DLSS (HUD) otherwise takes the sky's vector.
+    float contrast{8.0f};
+    float prior{0.02f};
 };
 
 struct FrameGenViewRequest {

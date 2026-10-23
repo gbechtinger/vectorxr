@@ -1495,6 +1495,8 @@ class FrameGenPresenter {
     bool game_motion_enabled_{false};
     bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
     std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
+    float game_contrast_{8.0f};          // FrameGenGameMotion::contrast (VECTORXR_FRAMEGEN_GAME_CONTRAST)
+    float game_prior_{0.02f};            // FrameGenGameMotion::prior (VECTORXR_FRAMEGEN_GAME_PRIOR)
     std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
     std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)
     std::uint64_t game_motion_reported_sent_{0};
