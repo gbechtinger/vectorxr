@@ -188,6 +188,10 @@ inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 2048u;
 // Flow passes drop vectors on flat blocks and vectors that do not beat no
 // motion (FrameGenTuning::flow_guard).
 inline constexpr std::uint32_t kFrameGenFlagFlowGuard = 16384u;
+// Interpolating: where the previous frame does not agree with the newest after the motion (text or edges the
+// vectors do not describe), the pixel shows the nearer real frame where it is instead of the motion-shifted one
+// (FrameGenTuning::hold_untrusted).
+inline constexpr std::uint32_t kFrameGenFlagHoldUntrusted = 32768u;
 
 // ===== Flow guard: the two values to edit ===================================
 // Used by the flow passes (FG_PASS_REFINE, FG_PASS_FLOW_UNPACK) through
@@ -460,6 +464,9 @@ struct FrameGenTuning {
     // clearly beat no motion (ghosting of content copied into plain
     // background). Always on.
     bool flow_guard{true};
+    // Interpolation shows the nearer real frame, unmoved, where the two real frames disagree after the motion
+    // (VECTORXR_FRAMEGEN_HOLD_UNTRUSTED=0 turns it off).
+    bool hold_untrusted{true};
     // The flow guard's thresholds (FlowKeep), set by kFrameGenFlowMargin and
     // kFrameGenFlatRange above.
     float flow_margin{kFrameGenFlowMargin};

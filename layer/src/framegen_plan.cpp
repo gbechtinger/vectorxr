@@ -120,6 +120,9 @@ FrameGenConstants BaseConstants(const FrameGenViewRequest& request, const FrameG
     if (tuning.flow_guard) {
         flags |= kFrameGenFlagFlowGuard;
     }
+    if (tuning.hold_untrusted && mode == FrameGenSynthesisMode::kInterpolate) {
+        flags |= kFrameGenFlagHoldUntrusted;
+    }
     base.options = {kFrameGenSearchRadius, flags, static_cast<std::uint32_t>(tuning.diagnostic), 0};
     base.tuning = {std::clamp(tuning.fractions[0], 0.0f, 1.0f), limit, 4.0f + 26.0f * suppression,
                    3.0f + 21.0f * suppression};

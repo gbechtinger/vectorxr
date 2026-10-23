@@ -78,6 +78,8 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 // and vectors that do not beat no motion, are dropped (see FlowKeep). Always
 // set by the plan (FrameGenTuning::flow_guard).
 #define FG_FLAG_FLOW_GUARD 16384u
+// Interpolating: untrusted pixels (the real frames disagree after the motion) show the nearer real frame unmoved.
+#define FG_FLAG_HOLD_UNTRUSTED 32768u
 
 // Linear depth at or beyond this many meters is treated as infinitely far.
 #define FG_FAR_DEPTH 100000.0
@@ -1313,6 +1315,18 @@ float4 Synthesize(float2 position, float fraction) {
             const float difference = MaxComponent(abs(Perceptual(previous.rgb) - Perceptual(current.rgb)));
             photometric_confidence = saturate(1.0 - max(difference - 0.03, 0.0) * g.tuning.w);
             result = lerp(current, previous, (1.0 - fraction) * photometric_confidence);
+            if ((g.options.y & FG_FLAG_HOLD_UNTRUSTED) != 0u && photometric_confidence < 1.0) {
+                // The two real frames disagree where the motion says they should match: it does not describe this
+                // pixel (text or edges drawn after DLSS, glass). Show the nearer real frame where it is, with no
+                // motion and no blend, rather than two displaced copies.
+                float2 here_uv;
+                const float4 newest_here = g_current.SampleLevel(g_linear, uv, 0.0);
+                const float4 held = fraction >= 0.5 ? newest_here
+                                                    : (MapToPrevious(uv, DepthAt(uv), here_uv)
+                                                           ? g_previous.SampleLevel(g_linear, here_uv, 0.0)
+                                                           : newest_here);
+                result = lerp(held, result, photometric_confidence);
+            }
             if ((g.options.y & FG_FLAG_CROSSFADE) != 0u) {
                 // Research: untrusted motion fades between the two real
                 // frames where they are, instead of showing the newest one.
