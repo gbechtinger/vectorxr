@@ -6,6 +6,21 @@ It is built for users who want practical controls for stereo depth, convergence,
 
 Developed by DienerTech LLC.
 
+## Changes in this fork
+
+This fork of VectorXR changes how Frame Generation measures motion and handles the parts of the picture that motion does not describe.
+
+**1. The game's own motion vectors, captured by a DLL.**
+A small `dxgi.dll` proxy (`mvcapture/`), placed in the game's folder, hooks DLSS and shares the motion vectors DLSS reads (and, optionally, the game's depth) with the OpenXR layer. Frame Generation then uses these vectors instead of measuring motion with the optical flow hardware: each cell of the picture tries the game's vector against "no motion" and keeps the one that matches the two real frames better. It is automatic once the DLL is in the game; without it, the layer measures motion as before. `VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1` generates frames only while the game's DLSS evaluations arrive, so menus and maps without DLSS show the game's frames untouched.
+
+**2. Fewer artifacts on text: menus, HUD, MFDs and HMD.**
+The game's motion vectors describe only the 3D scene. Text and displays that the game draws over it (HUD, helmet-mounted display, MFDs, menus) have no vector of their own and take the vector of whatever 3D content is behind them, such as the sky, so they can smear or appear twice while the view moves. Where the two real frames disagree after applying the motion, the interpolated frame now shows the nearer real frame unmoved instead of two displaced copies. The correction is per pixel and fades in with the disagreement, so everything else stays interpolated. `VECTORXR_FRAMEGEN_HOLD_UNTRUSTED=0` turns it off for comparison.
+
+**3. No repeated parts of the screen on plain backgrounds.**
+A flow guard stops the motion search from copying content into flat backgrounds (clear sky, plain panels): vectors on blocks with almost no texture, and vectors that barely beat "no motion", fade to no motion, so parts of the screen no longer repeat there. It applies where the layer measures motion itself (the shader flow and the optical flow hardware), and is always on. Its thresholds are `kFrameGenFlowMargin` and `kFrameGenFlatRange` in `layer/include/depthxr/framegen_plan.h`.
+
+See [mvcapture/README.md](mvcapture/README.md) for building and using the DLL.
+
 ## Why VectorXR
 
 **Pivot your foveated view.** When using OpenXR quad-views foveated rendering, VectorXR is the first and only solution that also pivots your head pose so the foveated region follows the rotated view. Foveated rendering exists in a few forms — the Quad-Views-Foveated OpenXR layer, some runtimes, some game engines — and neck-assist tools rotate the view, but no one had combined the two: run as independent OpenXR layers they don't coordinate, so the high-detail foveal region is left behind the moment the view rotates. VectorXR computes Pivot and Quadviews in a single layer with shared runtime state, keeping the foveal region locked to your gaze through the rotation. In DCS — the title that benefits from both at once — they work together cleanly.
