@@ -194,9 +194,6 @@ class FrameGenGpu {
     virtual void Reset() = 0;
     // Most recent GPU duration of a whole submission, or a negative value.
     virtual double LastGpuMilliseconds() const { return -1.0; }
-    // Research (VECTORXR_FRAMEGEN_EYE_TIMING=1, Direct3D 12, two eyes, no hardware flow): how long each eye's
-    // analysis took to finish on the GPU, in milliseconds. False when not measured.
-    virtual bool LastEyeMilliseconds(double& /*first*/, double& /*second*/) const { return false; }
     // When the newest submission whose timing has been read (a few
     // submissions after it) started and ended on the GPU.
     virtual std::optional<FrameGenGpuWindow> LastGpuWindow() const { return std::nullopt; }

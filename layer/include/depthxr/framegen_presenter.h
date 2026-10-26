@@ -1656,9 +1656,6 @@ class FrameGenPresenter {
     std::uint64_t eye_velocity_sequence_{0};
     double eye_move_sum_mm_{0.0};
     double eye_miss_sum_mm_{0.0};
-    double eye_gpu_first_sum_{0.0};  // VECTORXR_FRAMEGEN_EYE_TIMING: each eye's analysis on the GPU, summed over the window
-    double eye_gpu_second_sum_{0.0};
-    std::uint64_t eye_gpu_frames_{0};
     std::uint64_t eye_frames_{0};
     // When generation ran on the GPU: its start after the real frame's slot
     // was released and its end after the first generated slot was,

@@ -509,10 +509,6 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
                       ", motionEstimation=" + ToString(settings_.motion_estimation) +
                       ", diagnosticView=" + DiagnosticViewText(settings_.diagnostic_view) +
                       "; frame pacing is owned by Frame Generation (Turbo stays off).");
-        if (const char* eye_timing = std::getenv("VECTORXR_FRAMEGEN_EYE_TIMING"); eye_timing && std::string(eye_timing) == "1") {
-            logger_->Info("Frame Generation: each eye's analysis is timed on the GPU (VECTORXR_FRAMEGEN_EYE_TIMING=1); "
-                          "eyeGpuMs=first/second appears in the log once measured, with two eyes and no optical flow hardware.");
-        }
         if (!gpu_gate_setting.empty()) {
             logger_->Info("Frame Generation: GPU-aware pacing set by VECTORXR_FRAMEGEN_GPU_AHEAD=" + gpu_gate_setting +
                           (gpu_gate_enabled_ ? ": the game's waits are held until its GPU has run the capture of " +
@@ -4350,13 +4346,6 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
         execute_ms = Milliseconds(Clock::now() - execute_start);
         if (gpu_) {
             gpu_ms = gpu_->LastGpuMilliseconds();
-            double eye_first = 0.0;
-            double eye_second = 0.0;
-            if (gpu_->LastEyeMilliseconds(eye_first, eye_second)) {
-                eye_gpu_first_sum_ += eye_first;
-                eye_gpu_second_sum_ += eye_second;
-                ++eye_gpu_frames_;
-            }
             window = gpu_->LastGpuWindow();
             timings = gpu_->TakeTimings();
             depth = gpu_->DepthStatus();
@@ -6464,11 +6453,7 @@ void FrameGenPresenter::SummaryLocked(Clock::time_point now) {
             ")" + ", copiesSkipped=" + std::to_string(delta(&Totals::copies_skipped)) +
             ", repeated=" + std::to_string(repeated_) + ", failures=" + std::to_string(failures_) +
             ", captured=+" + std::to_string(delta(&Totals::captured)) + " (" + std::to_string(captured_) + ")" +
-            ", gpuMs=" + Number(gpu_ms_, 2) +
-            (eye_gpu_frames_ ? ", eyeGpuMs=" + Number(eye_gpu_first_sum_ / eye_gpu_frames_, 2) + "/" +
-                                   Number(eye_gpu_second_sum_ / eye_gpu_frames_, 2)
-                             : std::string()) +
-            ", depthUsed=" +
+            ", gpuMs=" + Number(gpu_ms_, 2) + ", depthUsed=" +
             Number(depth_window_frames_ ? 100.0 * depth_window_used_ / depth_window_frames_ : 0.0, 0) +
             "%, eyeShiftMm=" + Number(shift_window_frames_ ? shift_window_sum_mm_ / shift_window_frames_ : 0.0, 1) +
             "/" + Number(shift_window_max_mm_, 1) +
@@ -6520,8 +6505,6 @@ void FrameGenPresenter::NewSummaryWindowLocked(Clock::time_point now, double sta
     late_cycles_ = 0;
     eye_move_sum_mm_ = eye_miss_sum_mm_ = 0.0;
     eye_frames_ = 0;
-    eye_gpu_first_sum_ = eye_gpu_second_sum_ = 0.0;
-    eye_gpu_frames_ = 0;
     gpu_start_ms_.clear();
     gpu_done_ms_.clear();
     capture_done_ms_.clear();
