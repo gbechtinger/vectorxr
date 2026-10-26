@@ -40,6 +40,8 @@ system DLL name the game loads and add its forwarders to `src/dllmain.cpp`).
   the first evaluations' parameters (resource sizes and formats, subrects,
   jitter, scale).
 * `VECTORXR_MVCAPTURE=0` turns capture off; the DLL then only forwards DXGI.
+* `VECTORXR_MVCAPTURE_DEPTH=0` stops exporting the depth (only the motion vectors are published): no depth
+  conversion, copy or textures. Set it in the game's environment before the game starts; it is read once.
 
 ## Reading the data
 

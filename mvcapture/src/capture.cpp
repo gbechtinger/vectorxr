@@ -372,6 +372,17 @@ Slot* FindSlot(State& s, std::uint32_t ordinal, const void* feature, UINT base_x
     return oldest;
 }
 
+// VECTORXR_MVCAPTURE_DEPTH=0 in the game's environment: the depth is neither converted, copied nor published (the
+// motion vectors are), which saves a compute dispatch per evaluation and three textures per eye. Read once.
+bool DepthEnabled() {
+    static const bool enabled = [] {
+        wchar_t value[8]{};
+        const DWORD length = GetEnvironmentVariableW(L"VECTORXR_MVCAPTURE_DEPTH", value, 8);
+        return !(length > 0 && length < 8 && value[0] == L'0');
+    }();
+    return enabled;
+}
+
 // Converts or copies the game's depth into slot.depth[ring]. False when the
 // depth cannot be captured (logged once per stream).
 bool CaptureDepth(State& s, ID3D11DeviceContext* context, Slot& slot, std::uint32_t ring, ID3D11Resource* depth) {
@@ -602,7 +613,7 @@ void OnEvaluate(ID3D11DeviceContext* context, const NVSDK_NGX_Handle* feature, c
     const std::uint32_t ring = (slot->ring + 1) % kRing;
 
     const bool have_mv = CaptureMotion(s, context, *slot, ring, in.mv);
-    const bool have_depth = in.depth && CaptureDepth(s, context, *slot, ring, in.depth);
+    const bool have_depth = in.depth && DepthEnabled() && CaptureDepth(s, context, *slot, ring, in.depth);
     if (!have_mv) {
         return;
     }
