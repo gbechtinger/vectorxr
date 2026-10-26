@@ -509,6 +509,10 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
                       ", motionEstimation=" + ToString(settings_.motion_estimation) +
                       ", diagnosticView=" + DiagnosticViewText(settings_.diagnostic_view) +
                       "; frame pacing is owned by Frame Generation (Turbo stays off).");
+        if (const char* eye_timing = std::getenv("VECTORXR_FRAMEGEN_EYE_TIMING"); eye_timing && std::string(eye_timing) == "1") {
+            logger_->Info("Frame Generation: each eye's analysis is timed on the GPU (VECTORXR_FRAMEGEN_EYE_TIMING=1); "
+                          "eyeGpuMs=first/second appears in the log once measured, with two eyes and no optical flow hardware.");
+        }
         if (!gpu_gate_setting.empty()) {
             logger_->Info("Frame Generation: GPU-aware pacing set by VECTORXR_FRAMEGEN_GPU_AHEAD=" + gpu_gate_setting +
                           (gpu_gate_enabled_ ? ": the game's waits are held until its GPU has run the capture of " +
