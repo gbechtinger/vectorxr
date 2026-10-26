@@ -230,6 +230,7 @@ struct FrameSlot {
     UINT64 calibration_cpu{0};
     std::uint64_t timed_submission{0};
     bool hardware_timed{false};   // its stamps around the optical flow hardware were written
+    bool eye_timed{false};        // its stamps around each eye's analysis were written (VECTORXR_FRAMEGEN_EYE_TIMING)
     double hardware_call_ms{0.0}; // CPU time in the optical flow hardware's execute calls
     bool analysis_pending{false}; // an analysis whose timing TakeTimings has not returned
     UINT64 capture_mark{0};       // the newest capture submitted before it (0: none)
@@ -524,6 +525,20 @@ class D3D12FrameGen final : public FrameGenGpu {
                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_)))) {
             query_heap_.Reset();
             readback_.Reset();
+        }
+        // Research: VECTORXR_FRAMEGEN_EYE_TIMING=1 times each eye's analysis on its own, to see whether the GPU
+        // overlaps the two (see Execute). Three stamps per slot: before the first eye, after it, after the second.
+        if (const char* eye = std::getenv("VECTORXR_FRAMEGEN_EYE_TIMING"); eye && std::string(eye) == "1" && query_heap_) {
+            D3D12_QUERY_HEAP_DESC eye_queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, static_cast<UINT>(kFramesInFlight * 3), 0};
+            D3D12_RESOURCE_DESC eye_buffer = buffer;
+            eye_buffer.Width = kFramesInFlight * 3 * sizeof(UINT64);
+            if (FAILED(device_->CreateQueryHeap(&eye_queries, IID_PPV_ARGS(&eye_heap_))) ||
+                FAILED(device_->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &eye_buffer,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&eye_readback_)))) {
+                eye_heap_.Reset();
+                eye_readback_.Reset();
+            }
         }
         // Captures run on the game's queue, timed there: when each finished.
         D3D12_QUERY_HEAP_DESC capture_queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kCaptureSlots * 2, 0};
@@ -1912,6 +1927,7 @@ class D3D12FrameGen final : public FrameGenGpu {
             CollectTiming(slot, slot_index); // before its stamps are written again
         }
         slot.hardware_timed = false;
+        slot.eye_timed = false;
         slot.hardware_call_ms = 0.0;
         ReadDepthCheck(slot);
         hr = slot.allocator->Reset();
@@ -2017,9 +2033,25 @@ class D3D12FrameGen final : public FrameGenGpu {
         if (ok && !dump_directory_.empty()) {
             ok = RecordDump(views, dump, error);
         }
+        // The two eyes' plans are recorded one after the other in this list; stamps around each show how long each
+        // takes to finish. The eyes run the same work, so if the second takes much less than the first, the GPU
+        // overlapped them. Only without the hardware (its wait splits the plans) and with two eyes.
+        const bool eye_timing = eye_heap_ && timed && views.size() == 2 && !effective_tuning.hardware_flow;
+        const UINT eye_first = static_cast<UINT>(slot_index * 3);
+        if (eye_timing) {
+            commands_->EndQuery(eye_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, eye_first);
+        }
         for (std::size_t i = 0; i < views.size() && ok; ++i) {
             ok = RecordPlan(recordings[i], effective_tuning.hardware_flow, error);
             hardware = hardware || recordings[i].waits_for_hardware;
+            if (eye_timing && ok) {
+                commands_->EndQuery(eye_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, eye_first + 1 + static_cast<UINT>(i));
+            }
+        }
+        if (eye_timing && ok) {
+            commands_->ResolveQueryData(eye_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, eye_first, 3, eye_readback_.Get(),
+                                        eye_first * sizeof(UINT64));
+            slot.eye_timed = true;
         }
         if (ok && hardware) {
             ok = RunHardwareFlow(recordings, slot, slot_index, error);
@@ -3129,10 +3161,17 @@ class D3D12FrameGen final : public FrameGenGpu {
         capture_readback_.Detach();
         profile_heap_.Detach();
         profile_readback_.Detach();
+        eye_heap_.Detach();
+        eye_readback_.Detach();
         fence_.Detach();
     }
 
     double LastGpuMilliseconds() const override { return last_gpu_ms_; }
+    bool LastEyeMilliseconds(double& first, double& second) const override {
+        first = eye_ms_[0];
+        second = eye_ms_[1];
+        return eye_ms_[0] >= 0.0 && eye_ms_[1] >= 0.0;
+    }
     std::optional<FrameGenGpuWindow> LastGpuWindow() const override { return last_window_; }
     std::uint64_t WorkingMemoryBytes() const override {
         std::uint64_t bytes = 0;
@@ -3516,6 +3555,21 @@ class D3D12FrameGen final : public FrameGenGpu {
             }
             const D3D12_RANGE written{0, 0};
             readback_->Unmap(0, &written);
+        }
+        if (slot.eye_timed && eye_readback_) {
+            slot.eye_timed = false;
+            const D3D12_RANGE eye_range{slot_index * 3 * sizeof(UINT64), (slot_index + 1) * 3 * sizeof(UINT64)};
+            void* eye_mapped = nullptr;
+            if (SUCCEEDED(eye_readback_->Map(0, &eye_range, &eye_mapped))) {
+                const auto* stamps = reinterpret_cast<const UINT64*>(static_cast<const std::byte*>(eye_mapped) + eye_range.Begin);
+                if (stamps[1] >= stamps[0] && stamps[2] >= stamps[1]) {
+                    const double to_ms = 1000.0 / static_cast<double>(timestamp_frequency_);
+                    eye_ms_[0] = static_cast<double>(stamps[1] - stamps[0]) * to_ms;
+                    eye_ms_[1] = static_cast<double>(stamps[2] - stamps[1]) * to_ms;
+                }
+                const D3D12_RANGE none{0, 0};
+                eye_readback_->Unmap(0, &none);
+            }
         }
     }
 
@@ -5022,6 +5076,9 @@ class D3D12FrameGen final : public FrameGenGpu {
     ComPtr<ID3D12Resource> readback_;
     UINT64 timestamp_frequency_{0};
     double last_gpu_ms_{-1.0};
+    double eye_ms_[2]{-1.0, -1.0};                  // each eye's analysis (VECTORXR_FRAMEGEN_EYE_TIMING)
+    ComPtr<ID3D12QueryHeap> eye_heap_;
+    ComPtr<ID3D12Resource> eye_readback_;
     std::optional<FrameGenGpuWindow> last_window_;
     // GPU-aware pacing: the fence value of the newest capture (CaptureMark)
     // and the event WaitCapture waits on.
