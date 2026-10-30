@@ -5,6 +5,7 @@
 #include "depthxr/config_path.h"
 #include "depthxr/logger.h"
 #include "depthxr/process_info.h"
+#include "mvcapture/shared.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,8 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -707,6 +710,23 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
     swapchain_created_at_.reset();
     swapchain_created_frame_ = 0;
     engine_window_ = {};
+    {
+        // The game's own motion vectors (mvcapture's dxgi.dll in the game's folder) instead of measured motion.
+        // Automatic: without that DLL in the game the layer measures the motion as before.
+        // VECTORXR_FRAMEGEN_GAME_MOTION=0 turns it off even with the DLL.
+        const char* game = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION");
+        game_motion_enabled_ = !(game && std::string(game) == "0");
+        // ONLY: generate frames only while the game's DLSS evaluations arrive (see GameMotionFlowing); menus and
+        // screens without a DLSS session show the game's frames as they are, with no engaging or disengaging.
+        // Without the capture DLL nothing is ever generated.
+        const char* only = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_ONLY");
+        game_motion_only_ = only && std::string(only) == "1";
+        // Experiments: FORCE keeps the best game vector even where no motion
+        // matches the images better; FLIP reverses the vectors' direction.
+        const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
+        const char* flip = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FLIP");
+        game_motion_flags_ = (force && std::string(force) == "1" ? 1u : 0u) | (flip && std::string(flip) == "1" ? 2u : 0u);
+    }
     gpu_frames_ahead_ = 1;
     gpu_timeouts_in_row_ = 0;
     // VECTORXR_FRAMEGEN_LEAD=events: the lead steps by hitch events
@@ -2212,6 +2232,171 @@ bool FrameGenPresenter::TracesSwapchainCalls() const {
     return CapturingLocked();
 }
 
+namespace {
+
+// True once the capture DLL's block has been found in this process.
+bool g_game_motion_dll_seen = false;
+
+mvcapture::Reader& GameMotionReader() {
+    static mvcapture::Reader reader;
+    return reader;
+}
+
+// Opens the capture DLL's block once it exists. The DLL publishes it at the game's first DLSS evaluation, so keep
+// looking for it, but only once a second while it is absent.
+bool OpenGameMotionReader() {
+    mvcapture::Reader& reader = GameMotionReader();
+    static Clock::time_point next_try{};
+    if (!reader.Get()) {
+        const auto now = Clock::now();
+        if (now < next_try) {
+            return false;
+        }
+        if (!reader.Open()) {
+            next_try = now + std::chrono::seconds(1);
+            return false;
+        }
+    }
+    g_game_motion_dll_seen = true;
+    return true;
+}
+
+// VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1: whether the game's DLSS evaluations are arriving. False once none has been
+// seen for a second (menus, loading screens, anything without a DLSS session: the vectors the layer works from are
+// gone; frames are then shown as they are, without leaving the engaged state), and again true only after a run of new evaluations, so a stray one does not switch generation back on.
+// Called with the presenter's lock held; polls the shared block at most every 50 ms.
+bool GameMotionFlowing() {
+    constexpr auto kPoll = std::chrono::milliseconds(50);
+    constexpr auto kSilence = std::chrono::seconds(1);
+    constexpr std::uint64_t kResume = 20; // new evaluations needed to resume
+    static Clock::time_point checked{};
+    static Clock::time_point moved = Clock::now();
+    static std::uint64_t latest = 0;
+    static std::uint64_t at_stop = 0;
+    static bool flowing = false;
+    const auto now = Clock::now();
+    if (now - checked < kPoll) {
+        return flowing;
+    }
+    checked = now;
+    std::uint64_t seq = 0;
+    if (OpenGameMotionReader()) {
+        const mvcapture::Reader& reader = GameMotionReader();
+        for (std::uint32_t i = 0; i < mvcapture::kMaxSlots; ++i) {
+            mvcapture::SlotInfo info{};
+            if (reader.ReadSlot(i, info)) {
+                seq = std::max(seq, info.frame_seq);
+            }
+        }
+    }
+    if (seq != latest) {
+        // A smaller value is a new block (the game restarted its DLSS): count from there.
+        if (seq < latest) {
+            at_stop = 0;
+        }
+        latest = seq;
+        moved = now;
+    }
+    if (flowing) {
+        if (now - moved >= kSilence) {
+            flowing = false;
+            at_stop = latest;
+        }
+    } else if (latest > at_stop + kResume && now - moved < kSilence) {
+        flowing = true;
+    }
+    return flowing;
+}
+
+// The capture DLL's newest motion vectors for `view` (its slot: slots are in
+// the order the game's DLSS evaluations first ran, the eyes' order; the SWAP
+// variable exchanges the first two). False when the DLL is not loaded, the
+// slot has nothing new since `last_seq`, or the vectors cannot be used.
+bool ReadGameMotion(std::size_t view, std::uint64_t last_seq, FrameGenGameMotion& out, std::uint64_t& seq,
+                    FrameGenGameMotion* depth_out = nullptr) {
+    if (!OpenGameMotionReader()) {
+        return false;
+    }
+    const mvcapture::Reader& reader = GameMotionReader();
+    static const bool swap = [] {
+        const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_SWAP");
+        return value && std::string(value) == "1";
+    }();
+    std::uint32_t slot = static_cast<std::uint32_t>(view);
+    if (swap && slot < 2) {
+        slot = 1 - slot;
+    }
+    mvcapture::SlotInfo info{};
+    if (!reader.ReadSlot(slot, info) || info.frame_seq == last_seq) {
+        return false;
+    }
+    seq = info.frame_seq;
+    const std::uint64_t fence = reader.Get()->fence_handle;
+    const std::uint64_t texture = info.ring_index < mvcapture::kRing ? info.mv_handle[info.ring_index] : 0;
+    if (!texture || !fence || info.array_size != 1 || info.reset || info.width == 0 || info.height == 0) {
+        return false;
+    }
+    out = {};
+    out.valid = true;
+    out.texture = texture;
+    out.fence = fence;
+    out.fence_value = info.fence_value;
+    out.generation = info.generation;
+    out.width = info.width;
+    out.height = info.height;
+    out.format = info.mv_format;
+    out.render_width = info.render_width;
+    out.render_height = info.render_height;
+    out.base_x = info.mv_base_x;
+    out.base_y = info.mv_base_y;
+    out.scale_x = info.mv_scale_x != 0.0f ? info.mv_scale_x : 1.0f;
+    out.scale_y = info.mv_scale_y != 0.0f ? info.mv_scale_y : 1.0f;
+    if (depth_out) {
+        // The depth of the same evaluation, in the same ring slot and behind the same fence.
+        *depth_out = {};
+        const std::uint64_t depth = info.depth_handle[info.ring_index];
+        if (depth && info.depth_format) {
+            *depth_out = out;
+            depth_out->texture = depth;
+            depth_out->format = info.depth_format;
+            depth_out->base_x = info.depth_base_x;
+            depth_out->base_y = info.depth_base_y;
+        }
+    }
+    return true;
+}
+
+// VECTORXR_FRAMEGEN_GAME_DEPTH=<near>[,<far>]: use the depth the capture DLL shares as the view's depth, when the game
+// submits none to OpenXR. DLSS gives neither near nor far, so they are given here in meters (far omitted or 0:
+// infinite; "1" alone: near 0.2 m). Raw values may be reversed (near at 1): the depth validator tries both.
+const std::optional<FrameGenDepthEncoding>& GameDepthEncoding() {
+    static const std::optional<FrameGenDepthEncoding> encoding = []() -> std::optional<FrameGenDepthEncoding> {
+        const char* value = std::getenv("VECTORXR_FRAMEGEN_GAME_DEPTH");
+        if (!value || !*value || std::string(value) == "0") {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        float near_z = std::strtof(value, &end);
+        float far_z = 0.0f;
+        if (end && *end == ',') {
+            far_z = std::strtof(end + 1, nullptr);
+        }
+        if (!(near_z > 0.0f) || near_z == 1.0f) {
+            near_z = std::string(value) == "1" ? 0.2f : near_z;
+        }
+        if (!(near_z > 0.0f)) {
+            return std::nullopt;
+        }
+        if (!(far_z > near_z)) {
+            far_z = std::numeric_limits<float>::infinity();
+        }
+        return FrameGenDepthEncoding{0.0f, 1.0f, near_z, far_z};
+    }();
+    return encoding;
+}
+
+} // namespace
+
 void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t image_index) {
     auto capturing = [&] {
         if (!CapturingLocked()) {
@@ -2423,6 +2608,45 @@ void FrameGenPresenter::CaptureOnRelease(XrSwapchain swapchain, std::uint32_t im
     if (color_captured) {
         if (const auto record = swapchains_.find(swapchain); record != swapchains_.end()) {
             record->second.captured_releases = releases;
+        }
+    }
+    if (game_motion_enabled_) {
+        for (const Job& job : jobs) {
+            if (job.depth || !job.ok || job.view >= game_snapshots_.size()) {
+                continue;
+            }
+            GameMotionSnapshot& snapshot = game_snapshots_[job.view];
+            FrameGenGameMotion motion;
+            FrameGenGameMotion depth;
+            std::uint64_t seq = snapshot.frame_seq;
+            const bool fresh = ReadGameMotion(job.view, snapshot.frame_seq, motion, seq, &depth);
+            snapshot.swapchain = swapchain;
+            snapshot.releases = releases;
+            snapshot.frame_seq = seq;
+            snapshot.motion = fresh ? motion : FrameGenGameMotion{};
+            snapshot.depth = false;
+            if (fresh && depth.valid && GameDepthEncoding() && gpu_->SupportsGameDepth() &&
+                !std::any_of(jobs.begin(), jobs.end(),
+                             [&](const Job& other) { return other.depth && other.view == job.view; })) {
+                std::string depth_error;
+                snapshot.depth = gpu_->CaptureGameDepth(job.view, depth, *GameDepthEncoding(), job.request, depth_error);
+                if (snapshot.depth && logger_ && !logged_game_depth_) {
+                    logged_game_depth_ = true;
+                    logger_->Info("Frame Generation uses the game's depth from the capture DLL: format " +
+                                  std::to_string(depth.format) + ", near " + std::to_string(GameDepthEncoding()->near_z) +
+                                  ", far " + std::to_string(GameDepthEncoding()->far_z));
+                } else if (!snapshot.depth && !depth_error.empty() && logger_ && !logged_game_depth_failure_) {
+                    logged_game_depth_failure_ = true;
+                    logger_->Error("Frame Generation could not read the game's depth: " + depth_error);
+                }
+            }
+            if (fresh && logger_ && !logged_game_motion_) {
+                logged_game_motion_ = true;
+                logger_->Info("Frame Generation found the game's motion vectors: " + std::to_string(motion.width) + "x" +
+                              std::to_string(motion.height) + " format " + std::to_string(motion.format) + ", render " +
+                              std::to_string(motion.render_width) + "x" + std::to_string(motion.render_height) +
+                              ", scale " + std::to_string(motion.scale_x) + "," + std::to_string(motion.scale_y));
+            }
         }
     }
     // Each view's latest capture, as Execute matches it (ClaimQuadFrame).
@@ -3298,6 +3522,24 @@ bool FrameGenPresenter::WantsEngagementLocked() const {
     // Never from display times that do not advance with the time: refreshes
     // presented from them would never reach the game's frames.
     return RunnableLocked() && EffectiveMultiplierLocked() >= 2 && !QuadDeclinedLocked() && !clock_displaced_;
+}
+
+bool FrameGenPresenter::GameMotionAvailableLocked() const {
+    if (!(game_motion_enabled_ && game_motion_only_)) {
+        return true;
+    }
+    static bool last = false;
+    const bool flowing = GameMotionFlowing();
+    if (flowing != last) {
+        last = flowing;
+        if (logger_) {
+            logger_->Info(flowing ? "Frame Generation: the game's DLSS evaluations arrive; frames are generated "
+                                    "(VECTORXR_FRAMEGEN_GAME_MOTION_ONLY)."
+                                  : "Frame Generation: no DLSS evaluation from the game for 1 s; the game's frames are "
+                                    "shown as they are until they return (VECTORXR_FRAMEGEN_GAME_MOTION_ONLY).");
+        }
+    }
+    return flowing;
 }
 
 FrameGenState FrameGenPresenter::IdleStateLocked() const {
@@ -6212,7 +6454,10 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 submission.request.output = OutputKindLocked(i, record->second.format).value_or(*kind);
             }
             submission.request.newest = Geometry(view);
-            submission.request.synthesize = continuous && last_real_.views[i].extent.width == submission.request.extent.width &&
+            // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY: without the game's vectors nothing is measured or moved; the real
+            // frames are shown as they are (as at a pause), and generation goes on when the vectors return.
+            submission.request.synthesize = continuous && GameMotionAvailableLocked() &&
+                                            last_real_.views[i].extent.width == submission.request.extent.width &&
                                             last_real_.views[i].extent.height == submission.request.extent.height;
             submission.request.previous = submission.request.synthesize ? last_real_.views[i].geometry : Geometry(view);
             submission.request.temporal = true;
@@ -6251,6 +6496,25 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 }
             }
             engine_facts.captured = engine_facts.captured && record->second.captured_releases == record->second.releases;
+            if (!submission.request.depth && game_motion_enabled_ && i < game_snapshots_.size() &&
+                game_snapshots_[i].depth && game_snapshots_[i].swapchain == view.subImage.swapchain &&
+                game_snapshots_[i].releases == record->second.captured_releases) {
+                // The game's own depth (from the capture DLL), already linearized by CaptureGameDepth.
+                submission.request.depth = true;
+                depth_sent_ = true;
+                depth_readable_ = true;
+            }
+            if (game_motion_enabled_ && gpu_->SupportsGameMotion() && i < game_snapshots_.size()) {
+                const GameMotionSnapshot& snapshot = game_snapshots_[i];
+                if (snapshot.motion.valid && snapshot.swapchain == view.subImage.swapchain &&
+                    snapshot.releases == record->second.captured_releases) {
+                    submission.request.game_motion = snapshot.motion;
+                    submission.request.game_motion.flags = game_motion_flags_;
+                    ++game_motion_sent_;
+                } else if (g_game_motion_dll_seen) {
+                    ++game_motion_missing_;
+                }
+            }
         }
         if (!error.empty()) {
             NoteFailureLocked(error);
@@ -6333,6 +6597,14 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
         }
         const auto execute_start = Clock::now();
         ok = ok && gpu_->Execute(submissions, tuning, executed, error);
+        if (game_motion_enabled_) {
+            // Under the GPU lock, as the backend writes it.
+            const std::string status = gpu_->GameMotionStatus();
+            if (!status.empty() && status != game_motion_logged_status_) {
+                game_motion_logged_status_ = status;
+                if (logger_) logger_->Info("Frame Generation: " + status);
+            }
+        }
         execute_ms = Milliseconds(Clock::now() - execute_start);
         if (gpu_) {
             gpu_ms = gpu_->LastGpuMilliseconds();
@@ -8915,6 +9187,11 @@ void FrameGenPresenter::SummaryLocked(Clock::time_point now) {
             (gpu_gate_enabled_ && gpu_gate_armed_ ? "" : gpu_gate_enabled_ ? " (not armed)" : " (off)") +
             ", endCallMs=" + MedianAndMax(end_call_ms_) + ", runtimeEndMs=" + MedianAndMax(runtime_end_ms_) +
             ", synthLockMs=" + MedianAndMax(synth_lock_ms_) +
+            (game_motion_enabled_ && g_game_motion_dll_seen
+                 ? ", gameMotion=" + std::to_string(game_motion_sent_ - game_motion_reported_sent_) + "/" +
+                       std::to_string(game_motion_missing_ - game_motion_reported_missing_) +
+                       (game_motion_flags_ ? " flags=" + std::to_string(game_motion_flags_) : std::string())
+                 : std::string()) +
             (jit_ ? ", justInTime=1, covers=" + std::to_string(jit_covers_) + ", unwritten=" +
                         std::to_string(delta(&Totals::unwritten_wait)) + "/" +
                         std::to_string(delta(&Totals::unwritten_failed)) + "/" +
@@ -8980,6 +9257,8 @@ void FrameGenPresenter::NewSummaryWindowLocked(Clock::time_point now, double sta
     shift_window_frames_ = 0;
     jit_covers_ = 0;
     engine_window_ = {};
+    game_motion_reported_sent_ = game_motion_sent_;
+    game_motion_reported_missing_ = game_motion_missing_;
 }
 
 bool FrameGenPresenter::AnalyzeJit(const XrCompositionLayerProjection& projection, const PendingFrame& frame,

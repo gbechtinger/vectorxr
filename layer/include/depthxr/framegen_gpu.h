@@ -260,6 +260,21 @@ class FrameGenGpu {
     // job's vectors.image_index; files are written after the GPU, by a
     // thread of their own.
     virtual bool DumpMotion(const std::string& /*directory*/, bool /*all_images*/) { return false; }
+    // True when Execute() can consume FrameGenViewRequest::game_motion (shared motion vectors from the game).
+    virtual bool SupportsGameMotion() const { return false; }
+    // True when CaptureGameDepth can read the shared depth of the capture DLL.
+    virtual bool SupportsGameDepth() const { return false; }
+    // Linearizes the capture DLL's shared depth (`depth.texture` / `fence`, a raw buffer, not necessarily linear) into
+    // the view's depth, as CaptureDepth does for a depth layer the application submitted.
+    virtual bool CaptureGameDepth(std::size_t view, const FrameGenGameMotion& depth,
+                                  const FrameGenDepthEncoding& encoding, const FrameGenViewRequest& request,
+                                  std::string& error) {
+        (void)view; (void)depth; (void)encoding; (void)request;
+        error.clear();
+        return false;
+    }
+    // Why the game's motion vectors stopped being usable (empty while they are).
+    virtual std::string GameMotionStatus() const { return {}; }
     // How the game's depth is being read after checking it against the
     // other eye, with the evidence; counts decisions so callers log each once.
     virtual FrameGenDepthStatus DepthStatus() const { return {}; }

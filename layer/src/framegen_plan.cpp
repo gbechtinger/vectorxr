@@ -168,6 +168,12 @@ FrameGenConstants BaseConstants(const FrameGenViewRequest& request, const FrameG
         view |= step(tuning.prop_hold.threshold) << kFrameGenPropThresholdShift |
                 step(tuning.prop_hold.margin) << kFrameGenPropMarginShift;
     }
+    if (tuning.confidence_factors) {
+        flags |= kFrameGenFlagConfidenceFactors;
+    }
+    if (tuning.hold_untrusted && mode == FrameGenSynthesisMode::kInterpolate) {
+        flags |= kFrameGenFlagHoldUntrusted;
+    }
     base.options = {kFrameGenSearchRadius, flags, view, 0};
     base.tuning = {std::clamp(tuning.fractions[0], 0.0f, 1.0f), limit, 4.0f + 26.0f * suppression,
                    3.0f + 21.0f * suppression};
@@ -851,7 +857,11 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
     // only the downsample to the luma the merge matches on.
     const bool lead = FrameGenEngineLeads(request, tuning);
     const bool hardware = tuning.hardware_flow && !lead;
-    const bool measure = !lead || tuning.engine_predicate;
+    // The game's own motion vectors from the capture library, where the
+    // backend has them: tried as hypotheses against the luma pair instead of
+    // measuring the motion (no search, no refinement, no hardware flow).
+    const bool game_flow = request.game_motion.valid && !tuning.hardware_flow && !lead;
+    const bool measure = (!lead || tuning.engine_predicate) && !game_flow;
     const std::uint8_t measured_predicate = lead ? kFrameGenPredicateSkip : kFrameGenPredicateNone;
     if (lead) {
         AppendEngineEvidence(plan, base, request, tuning);
@@ -884,10 +894,33 @@ FrameGenViewPlan BuildFrameGenViewPlan(const FrameGenViewRequest& request, const
         plan.dispatches.push_back(unpack);
     }
 
+    if (game_flow) {
+        // One vector per cell of the final flow level, chosen among the
+        // game's vectors around the cell and no motion by the cost of
+        // matching the luma pair (see FG_PASS_FLOW_GAME). tuning.xy: a
+        // vector's unit in uv of the view; tuning.zw: the game's render
+        // region in texels, whose origin in the texture is options.x and
+        // options.z; options.w: texels of the luma a cell covers.
+        const FrameGenGameMotion& motion = request.game_motion;
+        const float render_width = static_cast<float>(motion.render_width ? motion.render_width : motion.width);
+        const float render_height = static_cast<float>(motion.render_height ? motion.render_height : motion.height);
+        FrameGenDispatch game = Dispatch(FrameGenPass::kFlowGame, plan.levels[plan.final_flow_level], plan.levels[1], base);
+        game.inputs = {Texture(FrameGenTextureKind::kGameMotion), Texture(FrameGenTextureKind::kLumaNewest, 1),
+                       Texture(FrameGenTextureKind::kLumaPrevious, 1), depth, {}, {}};
+        game.outputs = {Texture(FrameGenTextureKind::kFlow, plan.final_flow_level), {}};
+        game.constants.tuning = {motion.scale_x / std::max(render_width, 1.0f), motion.scale_y / std::max(render_height, 1.0f),
+                                 render_width, render_height};
+        game.constants.options[0] = motion.base_x;
+        game.constants.options[1] = motion.flags;
+        game.constants.options[2] = motion.base_y;
+        game.constants.options[3] = 1u << (plan.final_flow_level - 1);
+        plan.dispatches.push_back(game);
+    }
+
     // Where the vectors lead, kEngineMerge matches on the final level's
     // match level: the downsample to it is never skipped.
     const std::uint8_t merge_match = FrameGenMatchLevel(plan.final_flow_level);
-    for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels && !hardware; ++level) {
+    for (std::uint8_t level = 2; level <= kFrameGenPyramidLevels && !hardware && !game_flow; ++level) {
         const bool skippable = lead && level > merge_match;
         if (skippable && !measure) {
             break;
@@ -1720,6 +1753,7 @@ FrameGenViewRequest FrameGenHistoryState::Effective(const FrameGenViewRequest& r
     effective.synthesize = request.synthesize && history_valid_[Previous()];
     effective.temporal = effective.synthesize && request.temporal && filtered_valid_[Previous()];
     effective.trust_history = effective.synthesize && trust_valid_[Previous()];
+    effective.game_motion.valid = effective.game_motion.valid && effective.synthesize;
     return effective;
 }
 

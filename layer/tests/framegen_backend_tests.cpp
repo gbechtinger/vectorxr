@@ -2785,7 +2785,7 @@ const char* const kProfileNames[] = {"luma",        "downsample",  "search",    
                                      "engine convert", "engine merge", "engine tiles", "engine splat", "engine resolve",
                                      "engine fill", "trust surface", "filter prior", "synthesize sharpened",
                                      "synthesize16 sharpened", "synthesize prop", "synthesize16 prop",
-                                     "synthesize prop sharpened", "synthesize16 prop sharpened", "source copy", "output copy",
+                                     "synthesize prop sharpened", "synthesize16 prop sharpened", "game flow", "source copy", "output copy",
                                      "hardware wait", "compose", "flow merge"};
 static_assert(std::size(kProfileNames) == kFrameGenPassCount + 5, "a name per profiled category");
 

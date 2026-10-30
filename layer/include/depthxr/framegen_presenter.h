@@ -862,6 +862,16 @@ class FrameGenPresenter {
         std::uint64_t releases{0}; // the swapchain's SwapchainRecord::releases it captured
     };
 
+    // A view's latest game motion vectors (VECTORXR_FRAMEGEN_GAME_MOTION),
+    // read from the capture DLL when its color was released.
+    struct GameMotionSnapshot {
+        XrSwapchain swapchain{XR_NULL_HANDLE};
+        std::uint64_t releases{0}; // the swapchain's releases at that capture
+        std::uint64_t frame_seq{0}; // the capture DLL's count of this slot's DLSS evaluations
+        FrameGenGameMotion motion;
+        bool depth{false}; // the capture DLL's depth was linearized into the view's depth for this capture
+    };
+
     // An output image per output index: its extent and what it holds.
     struct OutputSpec {
         FrameGenExtent extent;
@@ -869,6 +879,9 @@ class FrameGenPresenter {
     };
 
     bool WantsEngagementLocked() const;
+    // False while VECTORXR_FRAMEGEN_GAME_MOTION_ONLY asks for the game's motion vectors and none arrive: frames are
+    // then shown as they are (Generate does not synthesize), the presenter staying engaged.
+    bool GameMotionAvailableLocked() const;
     // Frames are generated or about to be: the game's releases are captured.
     bool CapturingLocked() const;
     // The state while no frame is engaged: off when turned off, else waiting.
@@ -1986,6 +1999,18 @@ class FrameGenPresenter {
     std::optional<std::uint64_t> quad_claim_id_; // the ThreadedFrame claimed and not yet ended
     std::array<FrameGenExtent, 4> quad_extents_{};
     std::array<QuadCapture, 4> quad_captures_{};
+    bool game_motion_enabled_{false};
+    bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
+    std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
+    std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
+    std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)
+    std::uint64_t game_motion_reported_sent_{0};
+    std::uint64_t game_motion_reported_missing_{0};
+    std::string game_motion_logged_status_;
+    bool logged_game_motion_{false};
+    bool logged_game_depth_{false};
+    bool logged_game_depth_failure_{false};
+    std::array<GameMotionSnapshot, 4> game_snapshots_{};
     // Writing composed frames kept failing: the layer composes them until
     // then (doubling from quad_decline_first_ up to quad_decline_longest_).
     std::chrono::steady_clock::time_point quad_declined_until_{};

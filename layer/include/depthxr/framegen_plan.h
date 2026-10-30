@@ -138,8 +138,13 @@ enum class FrameGenPass : std::uint8_t {
     kSynthesizeFloat16Prop,
     kSynthesizeUnorm8PropSharpen,
     kSynthesizeFloat16PropSharpen,
+    // Game motion (FrameGenViewRequest::game_motion): the motion vectors the
+    // game gave its upscaler (captured by mvcapture), tried as hypotheses
+    // against the luma pair (head movement taken out) and written as the flow
+    // field kFlowUnpack writes for the optical flow hardware.
+    kFlowGame,
 };
-inline constexpr std::size_t kFrameGenPassCount = 47;
+inline constexpr std::size_t kFrameGenPassCount = 48;
 
 // Logical textures owned per view. History and filtered flow are ping-pong
 // pairs: "newest" is written this submission, "previous" is last
@@ -251,6 +256,9 @@ enum class FrameGenTextureKind : std::uint8_t {
     // the depth of each texel it decided (its magnitude), negated where it
     // left the texel open.
     kDepthDecided,
+    // The game's motion vectors for the newest frame (kFlowGame's input), as
+    // the game wrote them, at the size of its render target.
+    kGameMotion,
 };
 
 // The flow level the optical flow hardware fills: a 4x4 grid on the
@@ -427,6 +435,13 @@ inline constexpr std::uint32_t kFrameGenFlagFlowPriorWorld = 1u << 25;
 // of by its share of the view (tens of pixels before the tint shows): the
 // sub-pixel motion that moves content between real and generated frames.
 inline constexpr std::uint32_t kFrameGenFlagFlowFine = 1u << 23;
+// The confidence view shows each factor of the trust on its own colour
+// (FrameGenTuning::confidence_factors, research).
+inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 1u << 28;
+// Interpolating: where the previous frame does not agree with the newest after the motion (text or edges the
+// vectors do not describe), the pixel shows the nearer real frame where it is instead of the motion-shifted one
+// (FrameGenTuning::hold_untrusted).
+inline constexpr std::uint32_t kFrameGenFlagHoldUntrusted = 1u << 27;
 // World motion: samples per side of the fit's grid, and its iterations.
 inline constexpr std::uint32_t kFrameGenWorldGrid = 128u;
 // The trust vote's tile side in half-resolution texels (FG_TRUST_TILE):
@@ -582,6 +597,33 @@ struct FrameGenMotionEncoding {
     std::array<float, 3> offset{0.0f, 0.0f, 0.0f};
     bool two_d{false};
 };
+// The motion vectors a game gave its upscaler (DLSS) for a view's newest
+// frame, shared by VectorXR's mvcapture library (mvcapture/include/mvcapture/
+// shared.h): from each pixel of the frame to where its content was in the
+// previous frame, in pixels of the game's render target times the scale.
+// Handles are NT handles in this process; `generation` changes whenever the
+// library replaces its textures, so a handle number reused for another
+// texture is never taken for the old one.
+struct FrameGenGameMotion {
+    bool valid{false};
+    std::uint64_t texture{0};     // the shared texture (a Direct3D 11 texture opened here)
+    std::uint64_t fence{0};       // a shared fence signalled once `texture` holds the frame (0: none)
+    std::uint64_t fence_value{0};
+    std::uint64_t generation{0};
+    std::uint32_t width{0};       // the texture's size, and its DXGI format
+    std::uint32_t height{0};
+    std::uint32_t format{0};
+    std::uint32_t render_width{0}; // the region the game rendered into (the whole texture when 0)
+    std::uint32_t render_height{0};
+    std::uint32_t base_x{0};       // where that region starts in the texture
+    std::uint32_t base_y{0};
+    float scale_x{1.0f};           // multiplied into a vector to give pixels toward the previous frame
+    float scale_y{1.0f};
+    // Experiments (environment variables of the presenter): bit 0 keeps the
+    // best of the game's vectors even where no motion matches better, bit 1
+    // reverses their direction.
+    std::uint32_t flags{0};
+};
 
 struct FrameGenViewRequest {
     FrameGenExtent extent;
@@ -668,6 +710,10 @@ struct FrameGenViewRequest {
     // (kWorldParamsNewest), for the engine motion map of the frames written
     // from it.
     bool engine_world{false};
+    // The game's own motion vectors for the newest frame (set by the
+    // presenter from the capture library; the backend clears `valid` when it
+    // cannot use them, and then measures the motion as before).
+    FrameGenGameMotion game_motion;
 };
 
 // How far Frame Generation goes with a game's motion vectors
@@ -957,6 +1003,11 @@ struct FrameGenTuning {
     // test, and shown where its surface and the chosen vector's disagree
     // (depth engine mk2, M3; research, off by default).
     bool depth_splat{false};
+    // Research: the confidence view splits the trust by factor (colours: see Synthesize).
+    bool confidence_factors{false};
+    // Interpolation shows the nearer real frame, unmoved, where the two real frames disagree after the motion
+    // (VECTORXR_FRAMEGEN_HOLD_UNTRUSTED=0 turns it off).
+    bool hold_untrusted{true};
     // Quad views: how each eye is composed from its views, for the flow
     // merge and the focus views' motion limit; null on the canvas path. Not
     // owned: the caller keeps it alive for the Execute call.

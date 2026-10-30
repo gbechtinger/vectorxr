@@ -135,7 +135,8 @@ if(WIN32 AND DEPTHXR_BUILD_LAYER)
         TRUST_VOTE DEPTH_SCALE DEPTH_SCALE_VOTE DEPTH_STALE DEPTH_CROSS_SPLAT DEPTH_CROSS_RESOLVE ENGINE_CENSUS ENGINE_CAPTURE
         ENGINE_REDUCE ENGINE_SOLVE WORLD_SET ENGINE_CONVERT ENGINE_MERGE ENGINE_TILES SHIFT_SPLAT_ENGINE SHIFT_RESOLVE_ENGINE
         SHIFT_FILL_ENGINE TRUST_SURFACE FILTER_PRIOR SYNTHESIZE_UNORM8_SHARPEN SYNTHESIZE_FLOAT16_SHARPEN
-        SYNTHESIZE_UNORM8_PROP SYNTHESIZE_FLOAT16_PROP SYNTHESIZE_UNORM8_PROP_SHARPEN SYNTHESIZE_FLOAT16_PROP_SHARPEN)
+        SYNTHESIZE_UNORM8_PROP SYNTHESIZE_FLOAT16_PROP SYNTHESIZE_UNORM8_PROP_SHARPEN SYNTHESIZE_FLOAT16_PROP_SHARPEN
+        FLOW_GAME)
     set(_framegen_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/framegen.hlsl")
     set(_framegen_out "${CMAKE_CURRENT_BINARY_DIR}/framegen_shaders")
     file(MAKE_DIRECTORY "${_framegen_out}")
@@ -243,6 +244,7 @@ if(WIN32 AND DEPTHXR_BUILD_LAYER)
         "${_framegen_out}/framegen_shaders.cpp"
         "${_framegen_out}/framegen_flow_merge.h")
     target_include_directories(depthxr_framegen PUBLIC include)
+    target_include_directories(depthxr_framegen PRIVATE "${PROJECT_SOURCE_DIR}/mvcapture/include")
     target_include_directories(depthxr_framegen PRIVATE "${_framegen_out}")
     target_compile_features(depthxr_framegen PUBLIC cxx_std_20)
     # NVIDIA's optical flow accelerator (RTX 20-50) measures motion on

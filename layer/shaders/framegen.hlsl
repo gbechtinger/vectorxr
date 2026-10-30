@@ -257,6 +257,10 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 #ifndef FG_SPLAT_SKY
 #define FG_SPLAT_SKY 1
 #endif
+// The confidence view shows each factor of the trust on its own colour.
+#define FG_FLAG_CONFIDENCE_FACTORS 268435456u
+// Interpolating: untrusted pixels (the real frames disagree after the motion) show the nearer real frame unmoved.
+#define FG_FLAG_HOLD_UNTRUSTED 134217728u
 
 // Linear depth at or beyond this many meters is treated as infinitely far.
 #define FG_FAR_DEPTH 100000.0
@@ -2268,6 +2272,18 @@ float4 Synthesize(float2 position, float fraction) {
             const float difference = MaxComponent(abs(Perceptual(previous.rgb) - Perceptual(current.rgb)));
             photometric_confidence = saturate(1.0 - max(difference - 0.03, 0.0) * g.tuning.w);
             result = lerp(current, previous, (1.0 - fraction) * photometric_confidence);
+            if ((g.options.y & FG_FLAG_HOLD_UNTRUSTED) != 0u && photometric_confidence < 1.0) {
+                // The two real frames disagree where the motion says they should match: it does not describe this
+                // pixel (text or edges drawn after DLSS, glass). Show the nearer real frame where it is, with no
+                // motion and no blend, rather than two displaced copies.
+                float2 here_uv;
+                const float4 newest_here = g_current.SampleLevel(g_linear, uv, 0.0);
+                const float4 held = fraction >= 0.5 ? newest_here
+                                                    : (MapToPrevious(uv, DepthAt(uv), here_uv)
+                                                           ? g_previous.SampleLevel(g_linear, here_uv, 0.0)
+                                                           : newest_here);
+                result = lerp(held, result, photometric_confidence);
+            }
 #if defined(FG_SYNTH_SHARPEN)
             // Research (VECTORXR_FRAMEGEN_SYNTH_SHARPEN: the amount in
             // options.z's high half, set interpolating with depth for these
@@ -2357,6 +2373,16 @@ float4 Synthesize(float2 position, float fraction) {
             result.rgb = lerp(result.rgb, tint, 0.6 * saturate(magnitude * 4.0));
         }
     } else if (view == FG_VIEW_CONFIDENCE) {
+        if ((g.options.y & FG_FLAG_CONFIDENCE_FACTORS) != 0u) {
+            // One colour per factor, brighter the lower it is: red, the two real frames disagree (or, extrapolating
+            // at a boundary, the agreement); green, the filter's trust in the motion; blue, the motion exceeds the
+            // limit; white, the flow's matching cost. Untouched where every factor is high.
+            const float3 factors = saturate(float3(1.0 - photometric_confidence, 1.0 - chosen.w, 1.0 - motion_confidence));
+            const float cost = 1.0 - cost_confidence;
+            const float3 tint = saturate(factors + cost);
+            const float strength = max(max(factors.x, factors.y), max(factors.z, cost));
+            result.rgb = lerp(result.rgb, tint, 0.85 * strength);
+        } else {
         const float trust = confidence * photometric_confidence;
         result.rgb = lerp(result.rgb, float3(1.0, 0.1, 0.05), 0.75 * (1.0 - trust));
 #if !defined(__spirv__)
@@ -2379,6 +2405,7 @@ float4 Synthesize(float2 position, float fraction) {
             }
         }
 #endif
+        }
     } else if (view == FG_VIEW_TINT) {
         result.rgb *= float3(1.0, 0.8, 1.0);
     }
@@ -2964,7 +2991,7 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
 }
 #endif
 
-#if defined(FG_PASS_FLOW_UNPACK) || defined(FG_PASS_ENGINE_REDUCE) || defined(FG_PASS_ENGINE_CONVERT) || \
+#if defined(FG_PASS_FLOW_UNPACK) || defined(FG_PASS_FLOW_GAME) || defined(FG_PASS_ENGINE_REDUCE) || defined(FG_PASS_ENGINE_CONVERT) || \
     defined(FG_SHIFT_ENGINE)
 // The inverse of MapToPrevious: where a previous-view coordinate lies in the
 // newest view, for content at newest-view depth `depth` (rotation only
@@ -3098,6 +3125,143 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     }
     const float zero = zero_count >= 0.5 * max(count, 1.0) ? zero_sum / zero_count : -1.0;
     g_flow[id.xy] = float4(d / float2(extent), cost, zero);
+}
+#endif
+
+#if defined(FG_PASS_FLOW_GAME)
+FG_BIND(0) Texture2D<float4> g_motion : register(t0);
+FG_BIND(1) Texture2D<float4> g_luma_current : register(t1);
+FG_BIND(2) Texture2D<float4> g_luma_previous : register(t2);
+FG_BIND(3) Texture2D<float4> g_depth : register(t3);
+FG_BIND(4) FG_FORMAT("rgba16f") RWTexture2D<float4> g_flow : register(u0);
+
+// The game's own motion vectors (what it gave its upscaler: from each pixel
+// of the newest frame to where its content was in the previous frame, in
+// pixels of its render target times a scale) turned into the flow field the
+// optical flow hardware's vectors are (FG_PASS_FLOW_UNPACK): one vector per
+// cell, previous to newest frame, normalized, with the luma matching cost
+// and the cost of no motion.
+//
+// The luma pair already has the head's movement taken out (FG_PASS_LUMA), and
+// the game's vectors include it, so each vector is mapped back through the
+// head's movement like the hardware's vectors between frames as rendered
+// (MapToNewest), which leaves the content's own motion.
+//
+// A vector is only a hypothesis: the game's vectors are not defined on glass,
+// particles, the sky or across silhouettes (the upscaler dilates them itself).
+// Each cell tries the vectors at its centre and quadrants, and no motion, and
+// keeps the one that matches the luma best; no motion wins only where it
+// matches clearly better than every one of the game's.
+//
+// tuning.xy: uv of the view per unit of a vector; tuning.zw: the render
+// region in texels; options.x, options.z: its origin in the motion texture;
+// options.w: luma texels per cell side.
+#define FG_GAME_PRIOR 0.02
+#define FG_GAME_SPOTS 5
+static const float2 kGameSpots[FG_GAME_SPOTS] = {float2(0.5, 0.5), float2(0.25, 0.25), float2(0.75, 0.25),
+                                                 float2(0.25, 0.75), float2(0.75, 0.75)};
+
+// The game's vector at newest-view coordinate `uv` as uv of the view toward
+// the previous frame; false where it is not a number or longer than the view.
+bool GameVector(float2 uv, out float2 toward_previous) {
+    toward_previous = float2(0.0, 0.0);
+    uint width, height;
+    g_motion.GetDimensions(width, height);
+    const int2 origin = int2(int(g.options.x), int(g.options.z));
+    const int2 texel = clamp(origin + int2(floor(uv * g.tuning.zw)), int2(0, 0), int2(width, height) - 1);
+    const float2 raw = g_motion.Load(int3(texel, 0)).xy;
+    if (!all(isfinite(raw))) {
+        return false;
+    }
+    toward_previous = raw * g.tuning.xy;
+    if ((g.options.y & 2u) != 0u) {
+        toward_previous = -toward_previous;
+    }
+    return all(abs(toward_previous) < 1.0);
+}
+
+// The cost of the previous frame's content `offset` luma texels back over
+// the block of `scale` x `scale` texels of `cell`, as FG_PASS_FLOW_UNPACK
+// scores a vector.
+float MatchCost(int2 cell, int scale, int2 extent, int2 offset) {
+    float sum = 0.0;
+    float count = 0.0;
+    [loop]
+    for (int y = 0; y < scale; ++y) {
+        [loop]
+        for (int x = 0; x < scale; ++x) {
+            const int2 q = cell * scale + int2(x, y);
+            if (any(q >= extent)) {
+                continue;
+            }
+            const float current = g_luma_current.Load(int3(q, 0)).r;
+            const int2 s = q - offset;
+            const float previous = any(s < 0) || any(s >= extent) ? -1.0 : g_luma_previous.Load(int3(s, 0)).r;
+            sum += previous < 0.0 ? FG_INVALID_PENALTY : abs(current - previous);
+            count += 1.0;
+        }
+    }
+    return sum / max(count, 1.0) + FG_MOTION_PENALTY * length(float2(offset) / float2(extent));
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= g.size.xy)) {
+        return;
+    }
+    uint width, height;
+    g_luma_current.GetDimensions(width, height);
+    const int2 extent = int2(width, height);
+    const float2 extent_f = float2(extent);
+    const int scale = int(g.options.w);
+    const int2 cell = int2(id.xy);
+
+    // The cost of no motion over the texels the previous frame saw, as
+    // FG_PASS_FLOW_UNPACK reports it (w).
+    float zero_sum = 0.0;
+    float zero_count = 0.0;
+    float total = 0.0;
+    [loop]
+    for (int y = 0; y < scale; ++y) {
+        [loop]
+        for (int x = 0; x < scale; ++x) {
+            const int2 q = cell * scale + int2(x, y);
+            if (any(q >= extent)) {
+                continue;
+            }
+            total += 1.0;
+            const float still = g_luma_previous.Load(int3(q, 0)).r;
+            if (still >= 0.0) {
+                zero_sum += abs(g_luma_current.Load(int3(q, 0)).r - still);
+                zero_count += 1.0;
+            }
+        }
+    }
+    const float zero = zero_count >= 0.5 * max(total, 1.0) ? zero_sum / zero_count : -1.0;
+
+    const float no_motion_cost = MatchCost(cell, scale, extent, int2(0, 0));
+    float game_cost = 1.0e9;
+    float2 game_d = float2(0.0, 0.0);
+    const float2 corner = float2(cell * scale);
+    [unroll]
+    for (int i = 0; i < FG_GAME_SPOTS; ++i) {
+        const float2 spot = (corner + kGameSpots[i] * float(scale)) / extent_f;
+        float2 toward_previous;
+        float2 newest_uv;
+        if (!GameVector(spot, toward_previous) ||
+            !MapToNewest(spot + toward_previous, DepthNearest(g_depth, spot), newest_uv)) {
+            continue;
+        }
+        const float2 d = (spot - newest_uv) * extent_f;
+        const float cost = MatchCost(cell, scale, extent, int2(round(d)));
+        if (cost < game_cost) {
+            game_cost = cost;
+            game_d = d;
+        }
+    }
+    const bool force_game = (g.options.y & 1u) != 0u;
+    const bool use_game = game_cost < 1.0e8 && (force_game || game_cost <= no_motion_cost + FG_GAME_PRIOR);
+    g_flow[id.xy] = float4((use_game ? game_d : float2(0.0, 0.0)) / extent_f, use_game ? game_cost : no_motion_cost, zero);
 }
 #endif
 
