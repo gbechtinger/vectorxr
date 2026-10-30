@@ -33,3 +33,5 @@ local-signing/
 
 # scratch dir for user logs
 logs/
+
+mvcapture/include/nvsdk_ngx*.h
