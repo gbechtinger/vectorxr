@@ -162,6 +162,8 @@ struct FrameGenStatus {
     // vectors are research only so far: nothing sets this yet; the OSD and
     // the app say so once it does.
     bool motion_vectors{false};
+    // The game's DLSS motion vectors (VectorXR's mvcapture DLL) steered the generated frames within the last second.
+    bool game_motion{false};
     // Session totals for the summaries and tests.
     std::uint32_t lead_slots{0};      // refreshes between a game wait's release and its frame's refresh
     std::uint32_t lead_floor{0};      // the lowest lead known to hold this run (0: none yet)
@@ -2003,6 +2005,7 @@ class FrameGenPresenter {
     bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
     std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
     std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
+    std::chrono::steady_clock::time_point game_motion_last_{}; // when a view was last handed them
     std::uint64_t game_motion_missing_{0}; // views that had none (stale, not captured, or other)
     std::uint64_t game_motion_reported_sent_{0};
     std::uint64_t game_motion_reported_missing_{0};

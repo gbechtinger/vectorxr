@@ -6511,6 +6511,7 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                     submission.request.game_motion = snapshot.motion;
                     submission.request.game_motion.flags = game_motion_flags_;
                     ++game_motion_sent_;
+                    game_motion_last_ = Clock::now();
                 } else if (g_game_motion_dll_seen) {
                     ++game_motion_missing_;
                 }
@@ -10755,6 +10756,7 @@ FrameGenStatus FrameGenPresenter::Status() const {
     status.quad_unanalyzed = totals_.quad_unanalyzed;
     status.quad_write_declines = quad_write_declines_;
     status.quad_declining = now < quad_declined_until_;
+    status.game_motion = game_motion_last_ != Clock::time_point{} && now - game_motion_last_ < std::chrono::seconds(1);
     if (depth_seen_) {
         const FrameGenDepthEvidence& evidence = depth_status_.evidence;
         status.depth = !depth_sent_ ? FrameGenDepthState::kNotSent
@@ -10833,6 +10835,7 @@ FrameGenOsdText DescribeFrameGen(const FrameGenStatus& status, bool started) {
         text.state = "active";
         text.shown_fps = status.distinct_fps;
         text.row = std::string("On") + kOsd + mode + kOsd + rate;
+        if (status.game_motion) text.row += kOsd + std::string("Using Vectors");
         text.detail = rates + (gpu.empty() ? "" : kOsd + gpu);
         text.compact = rate + kOsd + rates;
         text.reason = mode + kApp + rate + kApp + rates + (gpu.empty() ? "" : kApp + gpu);
