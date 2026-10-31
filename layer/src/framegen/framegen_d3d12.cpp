@@ -1452,6 +1452,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         flush();
         view.depth_encoding = encoding;
         view.depth_generation = validator_.Generation();
+        view.depth_crossed = false;
         FrameGenDepthEncoding depth_encoding = encoding;
         if (validator_.Swapped()) {
             std::swap(depth_encoding.near_z, depth_encoding.far_z);
