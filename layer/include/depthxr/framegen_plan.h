@@ -442,6 +442,10 @@ inline constexpr std::uint32_t kFrameGenFlagConfidenceFactors = 1u << 28;
 // vectors do not describe), the pixel shows the nearer real frame where it is instead of the motion-shifted one
 // (FrameGenTuning::hold_untrusted).
 inline constexpr std::uint32_t kFrameGenFlagHoldUntrusted = 1u << 27;
+// The photometric check takes the smallest difference between the newest frame's pixel and the previous frame's
+// pixel or its four neighbours, so a sub-pixel vector error on fine detail (buildings) does not read as disagreement
+// (FrameGenTuning::photometric_neighborhood, research).
+inline constexpr std::uint32_t kFrameGenFlagPhotometricNeighborhood = 1u << 29;
 // World motion: samples per side of the fit's grid, and its iterations.
 inline constexpr std::uint32_t kFrameGenWorldGrid = 128u;
 // The trust vote's tile side in half-resolution texels (FG_TRUST_TILE):
@@ -1008,6 +1012,8 @@ struct FrameGenTuning {
     // Interpolation shows the nearer real frame, unmoved, where the two real frames disagree after the motion
     // (VECTORXR_FRAMEGEN_HOLD_UNTRUSTED=0 turns it off).
     bool hold_untrusted{true};
+    // Research: the photometric check tolerates a sub-pixel vector error (VECTORXR_FRAMEGEN_PHOTOMETRIC_NEIGHBORHOOD=1).
+    bool photometric_neighborhood{false};
     // Quad views: how each eye is composed from its views, for the flow
     // merge and the focus views' motion limit; null on the canvas path. Not
     // owned: the caller keeps it alive for the Execute call.

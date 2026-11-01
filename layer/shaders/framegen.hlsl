@@ -261,6 +261,9 @@ cbuffer FrameGenConstantBuffer : register(b0) {
 #define FG_FLAG_CONFIDENCE_FACTORS 268435456u
 // Interpolating: untrusted pixels (the real frames disagree after the motion) show the nearer real frame unmoved.
 #define FG_FLAG_HOLD_UNTRUSTED 134217728u
+// The photometric check tolerates a sub-pixel vector error: the smallest difference over the previous frame's pixel and its
+// four neighbours.
+#define FG_FLAG_PHOTOMETRIC_NEIGHBORHOOD 536870912u
 
 // Linear depth at or beyond this many meters is treated as infinitely far.
 #define FG_FAR_DEPTH 100000.0
@@ -2269,7 +2272,22 @@ float4 Synthesize(float2 position, float fraction) {
         float2 previous_uv;
         if (MapToPrevious(source - confidence * chosen.xy, DepthAt(source), previous_uv)) {
             const float4 previous = SampleColor(g_previous, previous_uv, cubic_previous);
-            const float difference = MaxComponent(abs(Perceptual(previous.rgb) - Perceptual(current.rgb)));
+            float difference = MaxComponent(abs(Perceptual(previous.rgb) - Perceptual(current.rgb)));
+            if ((g.options.y & FG_FLAG_PHOTOMETRIC_NEIGHBORHOOD) != 0u) {
+                // A vector off by a fraction of a pixel puts fine detail (windows, roof edges) a texel beside where it
+                // should be: take the closest match among the neighbours so that does not read as disagreement.
+                uint previous_width, previous_height;
+                g_previous.GetDimensions(previous_width, previous_height);
+                const float2 texel = 1.0 / float2(previous_width, previous_height);
+                const float3 newest = Perceptual(current.rgb);
+                const float2 offsets[4] = {float2(texel.x, 0.0), float2(-texel.x, 0.0), float2(0.0, texel.y),
+                                           float2(0.0, -texel.y)};
+                [unroll]
+                for (uint tap = 0u; tap < 4u; ++tap) {
+                    const float3 neighbour = Perceptual(g_previous.SampleLevel(g_linear, previous_uv + offsets[tap], 0.0).rgb);
+                    difference = min(difference, MaxComponent(abs(neighbour - newest)));
+                }
+            }
             photometric_confidence = saturate(1.0 - max(difference - 0.03, 0.0) * g.tuning.w);
             result = lerp(current, previous, (1.0 - fraction) * photometric_confidence);
             if ((g.options.y & FG_FLAG_HOLD_UNTRUSTED) != 0u && photometric_confidence < 1.0) {

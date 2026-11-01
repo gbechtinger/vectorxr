@@ -174,6 +174,9 @@ FrameGenConstants BaseConstants(const FrameGenViewRequest& request, const FrameG
     if (tuning.hold_untrusted && mode == FrameGenSynthesisMode::kInterpolate) {
         flags |= kFrameGenFlagHoldUntrusted;
     }
+    if (tuning.photometric_neighborhood) {
+        flags |= kFrameGenFlagPhotometricNeighborhood;
+    }
     base.options = {kFrameGenSearchRadius, flags, view, 0};
     base.tuning = {std::clamp(tuning.fractions[0], 0.0f, 1.0f), limit, 4.0f + 26.0f * suppression,
                    3.0f + 21.0f * suppression};
