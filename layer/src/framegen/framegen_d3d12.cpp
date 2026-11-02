@@ -863,7 +863,7 @@ class D3D12FrameGen final : public FrameGenGpu {
             hold_untrusted_ = std::string(hold) != "0";
         }
         if (const char* neighborhood = std::getenv("VECTORXR_FRAMEGEN_PHOTOMETRIC_NEIGHBORHOOD")) {
-            photometric_neighborhood_ = std::string(neighborhood) == "1";
+            photometric_neighborhood_ = std::string(neighborhood) != "0";
         }
         if (const char* factors = std::getenv("VECTORXR_FRAMEGEN_CONFIDENCE_FACTORS")) {
             confidence_factors_ = std::string(factors) == "1";
@@ -3184,7 +3184,7 @@ class D3D12FrameGen final : public FrameGenGpu {
         }
         effective_tuning.confidence_factors = tuning.confidence_factors || confidence_factors_;
         effective_tuning.hold_untrusted = tuning.hold_untrusted && hold_untrusted_;
-        effective_tuning.photometric_neighborhood = tuning.photometric_neighborhood || photometric_neighborhood_;
+        effective_tuning.photometric_neighborhood = tuning.photometric_neighborhood && photometric_neighborhood_;
         // The game's own motion vectors replace the optical flow hardware
         // when every view has them (a view without them would otherwise
         // need the hardware's session as well).
@@ -7218,7 +7218,7 @@ class D3D12FrameGen final : public FrameGenGpu {
     FrameGenFlowPrior flow_prior_;                  // FrameGenTuning::flow_prior forced (research)
     bool confidence_factors_{false};                // FrameGenTuning::confidence_factors forced (research)
     bool hold_untrusted_{true};                     // FrameGenTuning::hold_untrusted allowed
-    bool photometric_neighborhood_{false};          // FrameGenTuning::photometric_neighborhood forced (research)
+    bool photometric_neighborhood_{true};           // FrameGenTuning::photometric_neighborhood allowed
     std::array<FrameSlot, kFramesInFlight> slots_;
     ComPtr<ID3D12GraphicsCommandList> capture_commands_;
     std::array<CaptureSlot, kCaptureSlots> capture_slots_; // views x frames in flight, color and depth
