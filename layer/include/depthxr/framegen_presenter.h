@@ -584,6 +584,9 @@ class FrameGenPresenter {
     // The log level changed: a started session's trace follows debug logging
     // (a session starts with it as the level is then).
     void SetTraceEnabled(bool enabled);
+    // Whether the OSD is shown, for VECTORXR_FRAMEGEN_GAME_MOTION_WITH_OSD=1 (research): the game's vectors are used
+    // only while it is, so a flight compares them with the measured motion by toggling the OSD.
+    void SetOsdShown(bool shown) { osd_shown_.store(shown, std::memory_order_relaxed); }
     // The runtime shows only images of Frame Generation's own (just in time,
     // once its first frame is written): the game's are captured, never shown.
     bool ShowsOwnImagesOnly() const;
@@ -2003,6 +2006,11 @@ class FrameGenPresenter {
     std::array<QuadCapture, 4> quad_captures_{};
     bool game_motion_enabled_{false};
     bool game_motion_only_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_ONLY=1
+    bool game_motion_with_osd_{false}; // VECTORXR_FRAMEGEN_GAME_MOTION_WITH_OSD=1
+    std::atomic<bool> osd_shown_{false};
+    bool GameMotionLive() const {
+        return game_motion_enabled_ && (!game_motion_with_osd_ || osd_shown_.load(std::memory_order_relaxed));
+    }
     std::uint32_t game_motion_flags_{0}; // FrameGenGameMotion::flags, from the environment
     std::uint64_t game_motion_sent_{0};    // views handed the game's vectors
     std::chrono::steady_clock::time_point game_motion_last_{}; // when a view was last handed them

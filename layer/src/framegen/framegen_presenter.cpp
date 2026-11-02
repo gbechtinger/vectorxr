@@ -721,6 +721,10 @@ void FrameGenPresenter::Start(XrSession session, const void* binding_chain, cons
         // Without the capture DLL nothing is ever generated.
         const char* only = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_ONLY");
         game_motion_only_ = only && std::string(only) == "1";
+        // WITH_OSD=1: the vectors are used only while the OSD is shown (a flight toggles it to compare them with the
+        // measured motion); the OSD's Frame Generation row shows "Using Vectors" while they are.
+        const char* with_osd = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_WITH_OSD");
+        game_motion_with_osd_ = with_osd && std::string(with_osd) == "1";
         // Experiments: FORCE keeps the best game vector even where no motion
         // matches the images better; FLIP reverses the vectors' direction.
         const char* force = std::getenv("VECTORXR_FRAMEGEN_GAME_MOTION_FORCE");
@@ -6496,7 +6500,7 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 }
             }
             engine_facts.captured = engine_facts.captured && record->second.captured_releases == record->second.releases;
-            if (!submission.request.depth && game_motion_enabled_ && i < game_snapshots_.size() &&
+            if (!submission.request.depth && GameMotionLive() && i < game_snapshots_.size() &&
                 game_snapshots_[i].depth && game_snapshots_[i].swapchain == view.subImage.swapchain &&
                 game_snapshots_[i].releases == record->second.captured_releases) {
                 // The game's own depth (from the capture DLL), already linearized by CaptureGameDepth.
@@ -6504,7 +6508,7 @@ bool FrameGenPresenter::Generate(const XrCompositionLayerProjection& projection,
                 depth_sent_ = true;
                 depth_readable_ = true;
             }
-            if (game_motion_enabled_ && gpu_->SupportsGameMotion() && i < game_snapshots_.size()) {
+            if (GameMotionLive() && gpu_->SupportsGameMotion() && i < game_snapshots_.size()) {
                 const GameMotionSnapshot& snapshot = game_snapshots_[i];
                 if (snapshot.motion.valid && snapshot.swapchain == view.subImage.swapchain &&
                     snapshot.releases == record->second.captured_releases) {

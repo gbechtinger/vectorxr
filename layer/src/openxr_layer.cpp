@@ -11770,6 +11770,7 @@ void OpenXrLayer::PrepareOsd() {
     const auto [before, after]=osd_.Prepare(settings, std::move(snapshot), osd_toggle_down_, osd_cycle_down_,
                                             osd_settings_revision_);
     record();
+    framegen_.SetOsdShown(after.shown);
     const auto sound=[](const std::optional<SoundFeedback>& pressed, const std::vector<InputBinding>& bindings) {
         return pressed ? *pressed : bindings.empty() ? SoundFeedback{} : bindings.front().sound;
     };
